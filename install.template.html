@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EngineX-ray install</title>
+<style>
+  :root { --bg: #0b0c0e; --fg: #e8e8ea; --dim: #8a8f99; --accent: #5cf2c8; --card: #15171c; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, sans-serif; }
+  main { max-width: 580px; margin: 48px auto; padding: 0 16px; }
+  h1 { font-size: 30px; margin: 0 0 4px; color: var(--accent); }
+  p.sub { color: var(--dim); margin: 0 0 28px; }
+  a.bm { display: inline-block; padding: 12px 22px; background: var(--card); color: var(--accent); border: 2px solid var(--accent);
+         border-radius: 8px; font-weight: 750; font-size: 18px; text-decoration: none; cursor: grab; }
+  ol { padding-left: 22px; } li { margin: 10px 0; }
+  kbd { background: var(--card); border: 1px solid #333; border-radius: 4px; padding: 1px 6px; font-size: 14px; }
+  .card { background: var(--card); border-radius: 8px; padding: 14px 18px; margin-top: 28px; color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>EngineX-ray</h1>
+  <p class="sub">See what's under the hood of a WebAssembly game or app: engine, exported functions, hidden hooks, storage.</p>
+  <p><a class="bm" href="{{BOOKMARKLET}}" onclick="event.preventDefault()">EngineX-ray</a></p>
+  <ol>
+    <li><b>Drag the button</b> onto your bookmarks bar. (No bar? <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>.)</li>
+    <li>Open a browser game or WebAssembly app and get it running (some only load their engine after you press Play).</li>
+    <li><b>Click the bookmark.</b> A panel opens: Overview, Engine file, Strings, Globals, Storage, Console, Report. Click it again to hide or show the panel.</li>
+  </ol>
+  <div class="card">Everything runs in your own browser tab and only reads what the page already loaded. Nothing is sent anywhere.</div>
+</main>
+</body>
+</html>
