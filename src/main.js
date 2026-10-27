@@ -107,6 +107,7 @@
     state.globals = pageGlobals();
     for (const url of wasmUrls()) await addWasm(url);
     state.hints = await scriptHints();
+    state.tpTexts = await thirdPartyScriptTexts();
     state.storage = await storageReport();
     runSecurity();
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
@@ -320,7 +321,7 @@
     const texts = state.hints.texts ?? [];
     state.security = {
       'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
-      'Privacy': privacyFindings({ watcher, storage: state.storage, cookies }),
+      'Privacy': [...privacyFindings({ watcher, storage: state.storage, cookies }), ...staticFingerprinting([...texts, ...(state.tpTexts ?? [])])],
       'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
     };
   }
@@ -349,7 +350,7 @@
   }
   wire.security = () => {
     $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
-    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); runSecurity(); render(); };
+    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); state.tpTexts = await thirdPartyScriptTexts(); runSecurity(); render(); };
   };
 
   window.EngineXray = {

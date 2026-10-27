@@ -281,6 +281,23 @@ async function scriptHints() {
   return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers], texts };
 }
 
+// Third-party scripts the page loaded, re-read where the browser allows it (CDNs that send CORS headers). These are
+// the same files the page already downloaded, usually straight from cache; scripts that don't allow it are skipped.
+async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
+  const urls = [...new Set(performance.getEntriesByType('resource')
+    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin !== location.origin).map(e => e.name))].slice(0, max);
+  const out = [];
+  await Promise.all(urls.map(async url => {
+    try {
+      const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
+      if (!res.ok) return;
+      const text = await res.text();
+      if (text.length <= maxBytes) out.push([new URL(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
+    } catch {}
+  }));
+  return out;
+}
+
 async function fetchWasm(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
@@ -744,6 +761,32 @@ function privacyFindings({ watcher, storage, cookies }) {
   return findings;
 }
 
+// Fingerprinting code found by reading scripts, for pages that ran it before EngineX-ray was opened (the watcher can
+// only see calls made after it's switched on). A script with 3+ different markers can read the device details a
+// fingerprint is built from. Bot-detection scripts look the same, which the finding says.
+const FP_MARKERS = [
+  ['GPU model', /WEBGL_debug_renderer_info|UNMASKED_RENDERER_WEBGL|UNMASKED_VENDOR_WEBGL/],
+  ['audio fingerprint', /OfflineAudioContext|webkitOfflineAudioContext/],
+  ['canvas readback', /toDataURL[\s\S]{0,4000}fillText|fillText[\s\S]{0,4000}toDataURL/],
+  ['high-entropy client hints', /getHighEntropyValues/],
+  ['camera/mic list', /enumerateDevices/],
+  ['hardware details', /hardwareConcurrency[\s\S]{0,4000}deviceMemory|deviceMemory[\s\S]{0,4000}hardwareConcurrency/],
+  ['font probing', /(Arial|Helvetica|Verdana)[^\n]{0,400}(Courier New|Times New Roman|Georgia)[^\n]{0,400}(Comic Sans|Impact|Palatino|Garamond)/],
+  ['fingerprinting library', /FingerprintJS|fingerprintjs|ClientJS|\bfpjs\b|getCanvasFingerprint|x64hash128/],
+];
+
+function staticFingerprinting(texts) {
+  const findings = [];
+  for (const [where, text] of texts) {
+    if (!text || text.length < 200) continue;
+    const hits = FP_MARKERS.filter(([, re]) => re.test(text)).map(([name]) => name);
+    if (hits.length >= 3) findings.push({ sev: 'medium', title: `Fingerprinting code in ${where}`, evidence: [where, ...hits],
+      means: 'This script contains the code to read several hard-to-change details of your device: what a fingerprint is built from. Bot-detection and fraud scripts look the same; on a login or checkout page that may be its purpose.',
+      todo: 'Watch the page to see whether it actually runs. Browsers with fingerprinting protection (Firefox strict, Brave, Safari) blunt it.' });
+  }
+  return findings;
+}
+
 // ---- security/secrets.js ----
 // Tokens and secrets that page scripts can read. Values are always masked (first 4 + last 2 characters): the point is
 // to show that a secret is exposed and where, never to copy it.
@@ -937,6 +980,7 @@ function secretSources({ cookies, scriptTexts, files }) {
     state.globals = pageGlobals();
     for (const url of wasmUrls()) await addWasm(url);
     state.hints = await scriptHints();
+    state.tpTexts = await thirdPartyScriptTexts();
     state.storage = await storageReport();
     runSecurity();
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
@@ -1150,7 +1194,7 @@ function secretSources({ cookies, scriptTexts, files }) {
     const texts = state.hints.texts ?? [];
     state.security = {
       'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
-      'Privacy': privacyFindings({ watcher, storage: state.storage, cookies }),
+      'Privacy': [...privacyFindings({ watcher, storage: state.storage, cookies }), ...staticFingerprinting([...texts, ...(state.tpTexts ?? [])])],
       'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
     };
   }
@@ -1179,7 +1223,7 @@ function secretSources({ cookies, scriptTexts, files }) {
   }
   wire.security = () => {
     $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
-    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); runSecurity(); render(); };
+    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); state.tpTexts = await thirdPartyScriptTexts(); runSecurity(); render(); };
   };
 
   window.EngineXray = {

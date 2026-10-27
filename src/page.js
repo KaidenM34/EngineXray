@@ -39,6 +39,23 @@ export async function scriptHints() {
   return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers], texts };
 }
 
+// Third-party scripts the page loaded, re-read where the browser allows it (CDNs that send CORS headers). These are
+// the same files the page already downloaded, usually straight from cache; scripts that don't allow it are skipped.
+export async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
+  const urls = [...new Set(performance.getEntriesByType('resource')
+    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin !== location.origin).map(e => e.name))].slice(0, max);
+  const out = [];
+  await Promise.all(urls.map(async url => {
+    try {
+      const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
+      if (!res.ok) return;
+      const text = await res.text();
+      if (text.length <= maxBytes) out.push([new URL(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
+    } catch {}
+  }));
+  return out;
+}
+
 export async function fetchWasm(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);

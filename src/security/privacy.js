@@ -56,3 +56,29 @@ export function privacyFindings({ watcher, storage, cookies }) {
     means: 'Long-lived IDs that let analytics and ad services recognize you on your next visit.', todo: 'Clearing this site\'s data resets them.' });
   return findings;
 }
+
+// Fingerprinting code found by reading scripts, for pages that ran it before EngineX-ray was opened (the watcher can
+// only see calls made after it's switched on). A script with 3+ different markers can read the device details a
+// fingerprint is built from. Bot-detection scripts look the same, which the finding says.
+const FP_MARKERS = [
+  ['GPU model', /WEBGL_debug_renderer_info|UNMASKED_RENDERER_WEBGL|UNMASKED_VENDOR_WEBGL/],
+  ['audio fingerprint', /OfflineAudioContext|webkitOfflineAudioContext/],
+  ['canvas readback', /toDataURL[\s\S]{0,4000}fillText|fillText[\s\S]{0,4000}toDataURL/],
+  ['high-entropy client hints', /getHighEntropyValues/],
+  ['camera/mic list', /enumerateDevices/],
+  ['hardware details', /hardwareConcurrency[\s\S]{0,4000}deviceMemory|deviceMemory[\s\S]{0,4000}hardwareConcurrency/],
+  ['font probing', /(Arial|Helvetica|Verdana)[^\n]{0,400}(Courier New|Times New Roman|Georgia)[^\n]{0,400}(Comic Sans|Impact|Palatino|Garamond)/],
+  ['fingerprinting library', /FingerprintJS|fingerprintjs|ClientJS|\bfpjs\b|getCanvasFingerprint|x64hash128/],
+];
+
+export function staticFingerprinting(texts) {
+  const findings = [];
+  for (const [where, text] of texts) {
+    if (!text || text.length < 200) continue;
+    const hits = FP_MARKERS.filter(([, re]) => re.test(text)).map(([name]) => name);
+    if (hits.length >= 3) findings.push({ sev: 'medium', title: `Fingerprinting code in ${where}`, evidence: [where, ...hits],
+      means: 'This script contains the code to read several hard-to-change details of your device: what a fingerprint is built from. Bot-detection and fraud scripts look the same; on a login or checkout page that may be its purpose.',
+      todo: 'Watch the page to see whether it actually runs. Browsers with fingerprinting protection (Firefox strict, Brave, Safari) blunt it.' });
+  }
+  return findings;
+}
