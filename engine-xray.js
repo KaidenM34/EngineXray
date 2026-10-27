@@ -49,7 +49,7 @@ function parseWasm(buffer) {
   r.pos = 8;
   const out = {
     size: bytes.length, version, imports: [], exports: [], memories: [], tables: 0, globals: 0,
-    functions: { imported: 0, defined: 0 }, customSections: [], data: [], dataBytes: 0, functionNames: 0,
+    functions: { imported: 0, defined: 0 }, customSections: [], data: [], dataBytes: 0, functionNames: 0, names: [],
     sections: [],
   };
   while (r.pos < bytes.length) {
@@ -59,7 +59,7 @@ function parseWasm(buffer) {
       if (id === 0) {
         const name = r.name();
         out.customSections.push({ name, size: end - r.pos });
-        if (name === 'name') out.functionNames = countFunctionNames(r, end);
+        if (name === 'name') { out.names = readFunctionNames(r, end); out.functionNames = out.names.length; }
       } else if (id === 2) {
         for (let n = r.u32(); n--;) {
           const module = r.name(), field = r.name(), kind = r.byte();
@@ -104,14 +104,19 @@ function parseWasm(buffer) {
   return out;
 }
 
-// The "name" custom section: subsection 1 lists function names (debug builds and many engines keep it).
-function countFunctionNames(r, end) {
+// The "name" custom section: subsection 1 lists function names (debug builds and many engines keep it). Capped so a
+// huge debug build doesn't hold hundreds of thousands of strings.
+function readFunctionNames(r, end, cap = 200000) {
   while (r.pos < end) {
     const sub = r.byte(), len = r.u32(), next = r.pos + len;
-    if (sub === 1) return r.u32();
+    if (sub === 1) {
+      const names = [];
+      for (let n = r.u32(); n-- && names.length < cap;) { r.u32(); names.push(r.name()); }
+      return names;
+    }
     r.pos = next;
   }
-  return 0;
+  return [];
 }
 
 // Printable ASCII runs inside the data segments (where C/C++/Rust string literals end up), or the whole file if a
@@ -247,22 +252,33 @@ function wasmUrls() {
 // Engine files the page's own scripts mention, for games that load their engine inside a worker or build the URL at
 // runtime (both hide it from the resource list). Template parts like `${hash}` are dropped, so the guess is the plain
 // file name; the panel offers it as a one-click scan and says it's a guess.
+// EngineX-ray's own file, when it's loaded as a script (the test range does this). Its detection lists contain miner
+// and tracker names, so it must never scan itself.
+const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
+
 async function scriptHints() {
   const scripts = performance.getEntriesByType('resource')
     .filter(e => e.initiatorType === 'script' && new URL(e.name).origin === location.origin).map(e => e.name);
   for (const s of document.scripts) if (s.src && new URL(s.src).origin === location.origin) scripts.push(s.src);
-  const wasm = new Map(), workers = new Set();
-  for (const src of [...new Set(scripts)].slice(0, 25)) {
+  const wasm = new Map(), workers = new Set(), texts = [];
+  const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
+  while (queue.length && done.size < 40) {
+    const src = queue.shift();
+    if (done.has(src)) continue; done.add(src);
     let text = '';
     try { text = await (await fetch(src)).text(); } catch { continue; }
     if (text.length > 5e6) continue;
+    texts.push([src.split('/').pop().split('?')[0] || src, text]);
     for (const m of text.matchAll(/["'`]([^"'`\s]*?\.wasm)[^"'`\s]*["'`]/g)) {
       const raw = m[1], plain = raw.replace(/\$\{[^}]*\}/g, '').replace(/-+(?=\.wasm$)/, '');
       try { wasm.set(new URL(plain, src).href, { from: src.split('/').pop().split('?')[0], raw, guessed: raw !== plain }); } catch {}
     }
-    for (const m of text.matchAll(/new (?:Shared)?Worker\(\s*(?:new URL\()?\s*["'`]([^"'`]+)["'`]/g)) workers.add(m[1]);
+    for (const m of text.matchAll(/new (?:Shared)?Worker\(\s*(?:new URL\()?\s*["'`]([^"'`]+)["'`]/g)) {
+      workers.add(m[1]);
+      try { const u = new URL(m[1].replace(/\$\{[^}]*\}/g, ''), src); if (u.origin === location.origin) queue.push(u.href); } catch {} // read worker code too
+    }
   }
-  return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers] };
+  return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers], texts };
 }
 
 async function fetchWasm(url) {
@@ -390,6 +406,427 @@ function consoleRecorder(max = 3000) {
   };
 }
 
+// ---- security/lists.js ----
+// Reference data for the Security tab. Kept short and well-known on purpose: every entry here is something the panel
+// will name in a finding, so it has to be right. Add to these lists rather than loosening the matching.
+
+// Browser-mining services (most are defunct, but their scripts and clones still circulate).
+const MINER_DOMAINS = [
+  'coinhive.com', 'coin-hive.com', 'authedmine.com', 'crypto-loot.com', 'cryptoloot.pro', 'coinimp.com', 'coinimp.net',
+  'webminepool.com', 'minero.cc', 'jsecoin.com', 'ppoi.org', 'monerominer.rocks', 'cryptonoter.com', 'coinhave.com',
+  'webmine.cz', 'webmine.pro', 'coinpot.co', 'hashing.win', 'mineralt.io', 'freecontent.bid', 'deepminer.net',
+];
+
+// Text that shows up inside browser miners (JS, worker scripts or wasm strings / function names).
+const MINER_STRONG = /cryptonight|cryptonite|randomx|coinhive|coin-hive|cryptoloot|crypto-loot|coinimp|webminepool|deepminer|\bxmrig\b|stratum\+(tcp|ssl)|mining\.(subscribe|notify|authorize)|getHashesPerSecond|hashesPerSecond|setThrottle/i;
+const MINER_WEAK = /\bmonero\b|\bxmr\b|hashrate|\bnonce\b.*\btarget\b|job_id|\bgroestl\b|\bskein\b|\bjh256\b|blake256/i;
+// WebSocket URLs that look like a mining pool or proxy.
+const POOL_URL = /pool|stratum|xmr|monero|miner|mining|hashvault|nanopool|supportxmr|minexmr/i;
+// JSON-RPC methods of the stratum mining protocol (also used over WebSocket by browser miners).
+const STRATUM_FRAME = /"(method|type)"\s*:\s*"(login|submit|job|getjob|keepalived|mining\.\w+)"/i;
+
+// Little-endian byte patterns of well-known crypto tables. Finding one means the code computes that algorithm.
+// CryptoNight (Monero's old proof of work) = Keccak + AES rounds + one of BLAKE-256 / Groestl / JH / Skein.
+const CRYPTO_CONSTANTS = [
+  { id: 'keccak', name: 'Keccak / SHA-3 round constants', bytes: [0x8a, 0x80, 0, 0, 0, 0, 0, 0x80, 0, 0x80, 0, 0x80, 0, 0, 0, 0x80] },
+  { id: 'aes', name: 'AES S-box', bytes: [0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76] },
+  { id: 'aes', name: 'AES T-table', bytes: [0xa5, 0x63, 0x63, 0xc6, 0x84, 0x7c, 0x7c, 0xf8] },
+  { id: 'sha256k', name: 'SHA-256 round constants', bytes: [0x98, 0x2f, 0x8a, 0x42, 0x91, 0x44, 0x37, 0x71, 0xcf, 0xfb, 0xc0, 0xb5] },
+  { id: 'blake256', name: 'SHA-256 / BLAKE-256 initial values', bytes: [0x67, 0xe6, 0x09, 0x6a, 0x85, 0xae, 0x67, 0xbb] },
+  { id: 'blake2b', name: 'SHA-512 / BLAKE2b initial values', bytes: [0x08, 0xc9, 0xbc, 0xf3, 0x67, 0xe6, 0x09, 0x6a] },
+];
+
+// Third-party services by category. Matched on the end of the hostname.
+const TRACKERS = {
+  'session replay': ['hotjar.com', 'hotjar.io', 'fullstory.com', 'logrocket.com', 'logrocket.io', 'lr-ingest.io', 'clarity.ms',
+    'mouseflow.com', 'smartlook.com', 'inspectlet.com', 'luckyorange.com', 'quantummetric.com', 'contentsquare.net', 'glassboxdigital.io'],
+  'fingerprinting / bot detection': ['fpjs.io', 'fpcdn.io', 'fingerprint.com', 'fingerprintjs.com', 'online-metrix.net', 'iovation.com',
+    'px-cdn.net', 'perimeterx.net', 'datadome.co', 'kasada.io', 'arkoselabs.com'],
+  'ads': ['doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'adnxs.com', 'amazon-adsystem.com', 'criteo.com',
+    'criteo.net', 'taboola.com', 'outbrain.com', 'adsrvr.org', 'rubiconproject.com', 'pubmatic.com', 'openx.net', 'casalemedia.com',
+    'moatads.com', 'adform.net', 'bat.bing.com', 'ads-twitter.com', 'ads.linkedin.com', 'sharethrough.com', 'teads.tv', '33across.com'],
+  'social pixels': ['connect.facebook.net', 'facebook.com', 'analytics.tiktok.com', 'sc-static.net', 'ct.pinterest.com', 'snap.licdn.com',
+    'px.ads.linkedin.com', 'redditstatic.com', 'alb.reddit.com'],
+  'analytics': ['google-analytics.com', 'googletagmanager.com', 'analytics.google.com', 'segment.io', 'segment.com', 'mixpanel.com',
+    'amplitude.com', 'heap.io', 'heapanalytics.com', 'plausible.io', 'nr-data.net', 'newrelic.com', 'quantserve.com',
+    'scorecardresearch.com', 'chartbeat.com', 'chartbeat.net', 'parsely.com', 'static.cloudflareinsights.com', 'cloudflareinsights.com', 'pendo.io', 'posthog.com'],
+  'error monitoring': ['sentry.io', 'sentry-cdn.com', 'bugsnag.com', 'datadoghq.com', 'browser-intake-datadoghq.com'],
+};
+
+// Secret / token patterns. sev = severity when found in code or storage the page ships to every visitor.
+const SECRET_PATTERNS = [
+  { name: 'AWS access key ID', re: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, sev: 'high', means: 'Identifies an AWS account key. If its secret half is anywhere near it, anyone can use the account.' },
+  { name: 'Stripe secret key', re: /\b(sk|rk)_live_[0-9a-zA-Z]{20,}\b/g, sev: 'high', means: 'Full access to a Stripe account: charges, refunds, customer data.' },
+  { name: 'Stripe test secret key', re: /\b(sk|rk)_test_[0-9a-zA-Z]{20,}\b/g, sev: 'medium', means: 'A test-mode secret key. No real money, but it shows secret keys are being shipped to browsers.' },
+  { name: 'Stripe publishable key', re: /\bpk_(live|test)_[0-9a-zA-Z]{20,}\b/g, sev: 'info', means: 'Publishable keys are meant to be public. Fine on its own.' },
+  { name: 'GitHub token', re: /\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})\b/g, sev: 'high', means: 'Access to GitHub repositories as the token\'s owner.' },
+  { name: 'Slack token', re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, sev: 'high', means: 'Can read or post messages in a Slack workspace.' },
+  { name: 'Anthropic API key', re: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g, sev: 'high', means: 'Lets anyone run paid AI requests on the owner\'s account.' },
+  { name: 'OpenAI-style API key', re: /\bsk-(proj-)?[A-Za-z0-9_-]{32,}\b/g, sev: 'high', means: 'Lets anyone run paid AI requests on the owner\'s account.' },
+  { name: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}\b/g, sev: 'info', means: 'Often public by design (Maps, Firebase). Safe only if it is restricted to this site in the Google Cloud console.' },
+  { name: 'Private key', re: /-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----/g, sev: 'high', means: 'A private key should never be sent to a browser.' },
+];
+const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
+const SESSION_COOKIE = /sess|\bsid\b|auth|token|jwt|login|remember|access|refresh/i;
+const NOT_SESSION_COOKIE = /^(_ga|_gid|_gcl|_fbp|_fbc|__cf|cf_|_hj|ajs_|amplitude|mp_|_clck|_clsk|csrf|xsrf|_csrf|cookie_?consent|OptanonConsent)/i;
+const TRACKING_ID_KEYS = /^(_ga|_gid|_fbp|_fbc|ajs_anonymous_id|ajs_user_id|amplitude_id|_hjSessionUser|_clck|mp_.*_mixpanel|__hstc|hubspotutk|_uetvid|_pin_unauth|_tt_enable_cookie|_ttp)/i;
+
+function hostCategory(hostname) {
+  for (const [category, domains] of Object.entries(TRACKERS)) {
+    if (domains.some(d => hostname === d || hostname.endsWith('.' + d))) return category;
+  }
+  return null;
+}
+function isMinerHost(hostname) {
+  return MINER_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d));
+}
+
+// ---- security/hooks.js ----
+// "Watch this page": wraps a few browser APIs so the Security tab can see what scripts do from now on. Every wrapper
+// calls the original and returns its result unchanged; stop() puts the originals back. Nothing is blocked or sent.
+
+// The script that made the current call: the first http(s) URL in the stack that isn't EngineX-ray itself. (From a
+// bookmark our frames have no URL; loaded as a file, they carry this script's own URL, which is skipped.)
+function callerScript() {
+  const stack = new Error().stack ?? '';
+  for (const line of stack.split('\n').slice(1)) {
+    const m = /(https?:\/\/[^\s)]+?)(?::\d+){1,2}\)?\s*$/.exec(line);
+    if (m && !(SELF_URL && m[1].split('?')[0] === SELF_URL)) return m[1];
+  }
+  return '(inline script)';
+}
+
+function createWatcher() {
+  const restore = [];
+  const events = [];                // { tech, script, detail, t }
+  const sockets = [];               // { url, script, sent: [], received: [] }
+  const workers = [];               // { url, script }
+  const listeners = new Set();
+  let on = false, quiet = 0;
+
+  const record = (tech, detail = '') => {
+    if (quiet) return; // EngineX-ray's own analysis, not the page
+    events.push({ tech, script: callerScript(), detail: String(detail).slice(0, 200), t: Math.round(performance.now()) });
+    if (events.length > 5000) events.splice(0, 1000);
+    listeners.forEach(fn => fn());
+  };
+  const wrapMethod = (proto, name, tech, filter) => {
+    if (!proto || typeof proto[name] !== 'function') return;
+    const original = proto[name];
+    proto[name] = function (...args) {
+      if (!filter || filter.apply(this, args)) record(tech, typeof args[0] === 'string' || typeof args[0] === 'number' ? args[0] : '');
+      return original.apply(this, args);
+    };
+    restore.push(() => { proto[name] = original; });
+  };
+  const wrapGetter = (proto, name, tech) => {
+    const d = proto && Object.getOwnPropertyDescriptor(proto, name);
+    if (!d?.get) return;
+    Object.defineProperty(proto, name, { ...d, get() { record(tech, name); return d.get.call(this); } });
+    restore.push(() => Object.defineProperty(proto, name, d));
+  };
+  const wrapConstructor = (owner, name, onNew) => {
+    const Original = owner[name];
+    if (typeof Original !== 'function') return;
+    owner[name] = new Proxy(Original, { construct(target, args, newTarget) {
+      const obj = Reflect.construct(target, args, newTarget === owner[name] ? target : newTarget);
+      try { onNew(obj, args); } catch {}
+      return obj;
+    } });
+    restore.push(() => { owner[name] = Original; });
+  };
+
+  function start() {
+    if (on) return; on = true;
+    // fingerprinting
+    wrapMethod(HTMLCanvasElement.prototype, 'toDataURL', 'canvas readback');
+    wrapMethod(HTMLCanvasElement.prototype, 'toBlob', 'canvas readback');
+    wrapMethod(CanvasRenderingContext2D.prototype, 'getImageData', 'canvas readback');
+    wrapMethod(CanvasRenderingContext2D.prototype, 'measureText', 'font probing (measureText)');
+    for (const GL of [window.WebGLRenderingContext, window.WebGL2RenderingContext]) {
+      if (!GL) continue;
+      wrapMethod(GL.prototype, 'getParameter', 'GPU model (WebGL)', p => p === 0x9245 || p === 0x9246);
+      wrapMethod(GL.prototype, 'getExtension', 'GPU model (WebGL)', n => n === 'WEBGL_debug_renderer_info');
+    }
+    wrapConstructor(window, 'OfflineAudioContext', () => record('audio fingerprint (OfflineAudioContext)'));
+    for (const prop of ['hardwareConcurrency', 'deviceMemory', 'plugins', 'mimeTypes']) wrapGetter(Navigator.prototype, prop, 'device details (navigator)');
+    if (window.NavigatorUAData) wrapMethod(NavigatorUAData.prototype, 'getHighEntropyValues', 'device details (navigator)');
+    if (window.MediaDevices) wrapMethod(MediaDevices.prototype, 'enumerateDevices', 'camera/mic list (enumerateDevices)');
+    wrapMethod(Navigator.prototype, 'getBattery', 'battery status');
+    wrapConstructor(window, 'RTCPeerConnection', () => record('WebRTC (can reveal local IP)'));
+    // networking and threads
+    wrapConstructor(window, 'WebSocket', (ws, args) => {
+      const entry = { url: String(args[0]), script: callerScript(), sent: [], received: [] };
+      sockets.push(entry);
+      const send = ws.send;
+      ws.send = function (data) { if (entry.sent.length < 8) entry.sent.push(String(data).slice(0, 300)); listeners.forEach(fn => fn()); return send.call(this, data); };
+      ws.addEventListener('message', e => { if (entry.received.length < 8) { entry.received.push(String(e.data).slice(0, 300)); listeners.forEach(fn => fn()); } });
+      listeners.forEach(fn => fn());
+    });
+    wrapConstructor(window, 'Worker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); listeners.forEach(fn => fn()); });
+    wrapConstructor(window, 'SharedWorker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); listeners.forEach(fn => fn()); });
+  }
+  function stop() {
+    if (!on) return; on = false;
+    while (restore.length) restore.pop()();
+  }
+
+  // Per script: which fingerprinting techniques it used, and how often.
+  function byScript() {
+    const out = new Map();
+    for (const e of events) {
+      if (!out.has(e.script)) out.set(e.script, new Map());
+      const techs = out.get(e.script);
+      techs.set(e.tech, (techs.get(e.tech) ?? 0) + 1);
+    }
+    return out;
+  }
+
+  // Run fn without recording: used for EngineX-ray's own work (its checks read navigator too).
+  const quietly = fn => { quiet++; try { return fn(); } finally { quiet--; } };
+
+  return { start, stop, quietly, get on() { return on; }, events, sockets, workers, byScript, onChange: fn => listeners.add(fn) };
+}
+
+// ---- security/miner.js ----
+// Hidden crypto-miner detection. Evidence is combined, never trusted alone: AES and SHA tables are in plenty of normal
+// software, so constants only raise the alarm together with miner text, pool traffic or known miner hosts.
+
+// Which crypto tables a wasm file contains. Scans data segments at 4-byte steps (tables are word-aligned in memory).
+function cryptoConstants(mod) {
+  const found = new Map();
+  const byPrefix = new Map();
+  for (const c of CRYPTO_CONSTANTS) {
+    const prefix = c.bytes[0] | c.bytes[1] << 8 | c.bytes[2] << 16 | (c.bytes[3] << 24 >>> 0);
+    (byPrefix.get(prefix >>> 0) ?? byPrefix.set(prefix >>> 0, []).get(prefix >>> 0)).push(c);
+  }
+  const b = mod.bytes, view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const ranges = mod.data.length ? mod.data : [{ start: 0, size: b.length }];
+  for (const { start, size } of ranges) {
+    for (let i = start, end = start + size - 16; i <= end; i += 4) {
+      const hits = byPrefix.get(view.getUint32(i, true));
+      if (!hits) continue;
+      for (const c of hits) {
+        if (found.has(c.id)) continue;
+        let ok = true;
+        for (let k = 4; k < c.bytes.length; k++) if (b[i + k] !== c.bytes[k]) { ok = false; break; }
+        if (ok) found.set(c.id, c.name);
+      }
+    }
+  }
+  return found; // id -> name
+}
+
+function minerFindings({ files, hints, watcher, workerTexts }) {
+  const findings = [];
+  const strongText = [], weakText = [];
+  const check = (where, text) => {
+    const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0]}" in ${where}`);
+    const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0]}" in ${where}`);
+  };
+
+  // 1. Known miner services loaded by the page.
+  const hosts = performance.getEntriesByType('resource').map(e => { try { return new URL(e.name).hostname; } catch { return ''; } });
+  const minerHosts = [...new Set(hosts.filter(isMinerHost))];
+  if (minerHosts.length) findings.push({ sev: 'high', title: 'Loads a known browser-mining service', evidence: minerHosts,
+    means: 'This page pulled code from a service that exists to mine cryptocurrency in visitors\' browsers.', todo: 'Close the tab. If it\'s your site, look for a compromised script or ad tag.' });
+
+  // 2. Each engine file: crypto tables + miner text in its strings and function names.
+  for (const f of files.filter(x => x.mod)) {
+    const name = f.url.split('/').pop();
+    // The file doesn't change, so its scan is done once and kept (big engines are tens of MB).
+    f.minerScan ??= {
+      consts: cryptoConstants(f.mod),
+      strong: [...findStrings(f.mod, { minLength: 4, filter: MINER_STRONG, limit: 5 }).strings.map(s => `"${s.slice(0, 60)}" in ${name}`),
+        ...(f.mod.names ?? []).filter(n => MINER_STRONG.test(n)).slice(0, 5).map(fn => `function ${fn}() in ${name}`)],
+      weak: findStrings(f.mod, { minLength: 4, filter: MINER_WEAK, limit: 5 }).strings.map(s => `"${s.slice(0, 60)}" in ${name}`),
+      randomxText: findStrings(f.mod, { minLength: 4, filter: /randomx|argon2/i, limit: 1 }).strings.length > 0,
+    };
+    const consts = f.minerScan.consts;
+    strongText.push(...f.minerScan.strong); weakText.push(...f.minerScan.weak);
+    const finalizer = consts.has('blake256') || weakText.some(t => /groestl|skein|jh256|blake256/i.test(t) && t.endsWith(name));
+    const cryptonight = consts.has('keccak') && consts.has('aes') && finalizer;
+    const randomx = consts.has('blake2b') && f.minerScan.randomxText;
+    if (cryptonight || randomx) {
+      findings.push({ sev: f.minerScan.strong.length ? 'high' : 'low', title: `${name}: ${cryptonight ? 'CryptoNight' : 'RandomX'}-shaped hashing code`,
+        evidence: [...consts.values(), ...(randomx ? ['RandomX / Argon2 text'] : [])],
+        means: cryptonight
+          ? 'Keccak + AES + a BLAKE/Groestl/JH/Skein finalizer is the recipe of CryptoNight, the proof-of-work browser miners used for Monero. ' + (f.minerScan.strong.length ? 'Together with the miner text in the same file, this is very likely a miner.' : 'Crypto libraries can contain the same pieces, so on its own this is only a lead.')
+          : 'BLAKE2b plus RandomX/Argon2 text is the shape of RandomX, Monero\'s current proof of work.',
+        todo: f.minerScan.strong.length ? 'Treat as a miner. Watch the page to see if it connects to a pool.' : 'Check the Strings tab and watch the page for pool connections before concluding anything.' });
+    } else if (consts.size) {
+      findings.push({ sev: 'info', title: `${name}: contains standard crypto tables`, evidence: [...consts.values()],
+        means: 'Normal for apps that hash or encrypt (downloads, saves, networking). Not a miner signal by itself.', todo: 'Nothing, unless other miner signs show up.' });
+    }
+  }
+
+  // 3. Scripts and workers the page ships.
+  for (const [where, text] of workerTexts) check(where, text);
+  if (strongText.length) findings.push({ sev: 'high', title: 'Mining code text found', evidence: [...new Set(strongText)].slice(0, 8),
+    means: 'Names of mining algorithms, miner products or mining-protocol messages appear in the page\'s code.', todo: 'Confirm by watching the page: a miner will connect to a pool and keep the CPU busy.' });
+  else if (weakText.length >= 2) findings.push({ sev: 'low', title: 'Mining-related words found', evidence: [...new Set(weakText)].slice(0, 8),
+    means: 'Words like "monero", "hashrate" or "job_id" appear. Common in crypto or finance apps too.', todo: 'Only a lead. Look for stronger signs.' });
+
+  // 4. Live: pool connections and worker swarms.
+  if (watcher) {
+    for (const s of watcher.sockets) {
+      const frames = [...s.sent, ...s.received].filter(x => STRATUM_FRAME.test(x));
+      let host = ''; try { host = new URL(s.url).hostname; } catch {}
+      if (frames.length) findings.push({ sev: 'high', title: 'Talks the mining (stratum) protocol', evidence: [s.url, ...frames.slice(0, 3)],
+        means: 'The page sent or received mining-pool messages (login / job / submit) over a WebSocket.', todo: 'This is a miner. Close the tab; if it\'s your site, find the script that opened the socket: ' + s.script });
+      else if (POOL_URL.test(s.url) || isMinerHost(host)) findings.push({ sev: 'medium', title: 'WebSocket to a pool-like address', evidence: [s.url, 'opened by ' + s.script],
+        means: 'The address looks like a mining pool or proxy.', todo: 'Keep watching for stratum messages to confirm.' });
+    }
+    const cores = navigator.hardwareConcurrency || 4;
+    if (watcher.workers.length >= Math.max(3, cores - 1)) findings.push({ sev: 'medium', title: `Started ${watcher.workers.length} workers (you have ${cores} cores)`, evidence: [...new Set(watcher.workers.map(w => w.url))].slice(0, 5),
+      means: 'Miners start one worker per CPU core to use all of it. Games and video tools do this too.', todo: 'Check your CPU use (Activity Monitor). Sustained 100% on an idle page is a miner sign.' });
+  }
+  return findings;
+}
+
+// ---- security/privacy.js ----
+// Privacy: who the page shares you with (third-party services by category), whether a script is fingerprinting your
+// device (from the live watcher), and which long-lived tracking IDs are stored in your browser.
+
+function thirdParties() {
+  const first = location.hostname.split('.').slice(-2).join('.');
+  const byHost = new Map();
+  for (const e of performance.getEntriesByType('resource')) {
+    let host; try { host = new URL(e.name).hostname; } catch { continue; }
+    if (!host || host === location.hostname || host.endsWith('.' + first) || host === first) continue;
+    const entry = byHost.get(host) ?? { host, category: hostCategory(host), count: 0, kinds: new Set() };
+    entry.count++; entry.kinds.add(e.initiatorType);
+    byHost.set(host, entry);
+  }
+  return [...byHost.values()].sort((a, b) => (b.category ? 1 : 0) - (a.category ? 1 : 0) || b.count - a.count);
+}
+
+const FP_TECHS = ['canvas readback', 'font probing (measureText)', 'GPU model (WebGL)', 'audio fingerprint (OfflineAudioContext)',
+  'device details (navigator)', 'camera/mic list (enumerateDevices)', 'battery status', 'WebRTC (can reveal local IP)'];
+
+function privacyFindings({ watcher, storage, cookies }) {
+  const findings = [];
+  const parties = thirdParties();
+  const cat = c => parties.filter(p => p.category === c).map(p => p.host);
+
+  const replay = cat('session replay');
+  if (replay.length) findings.push({ sev: 'high', title: 'Session replay: your clicks and typing are recorded', evidence: replay,
+    means: 'These services record mouse movement, clicks, scrolling and often keystrokes so the site can watch your visit like a video.', todo: 'Avoid typing anything sensitive here, or block the hosts with a content blocker.' });
+  const fpServices = cat('fingerprinting / bot detection');
+  if (fpServices.length) findings.push({ sev: 'medium', title: 'Uses a device-fingerprinting / bot-detection service', evidence: fpServices,
+    means: 'These build an ID from your device\'s quirks that survives clearing cookies. Often used for fraud and bot checks.', todo: 'Expected on login and checkout pages. Elsewhere, it\'s tracking.' });
+  for (const [c, sev] of [['ads', 'low'], ['social pixels', 'low'], ['analytics', 'info'], ['error monitoring', 'info']]) {
+    const hosts = cat(c);
+    if (hosts.length) findings.push({ sev, title: `${hosts.length} ${c} service${hosts.length > 1 ? 's' : ''}`, evidence: hosts,
+      means: { ads: 'Ad networks follow you between sites to target ads.', 'social pixels': 'Tells social networks you visited, even if you never clicked a share button.', analytics: 'Measures how visitors use the site.', 'error monitoring': 'Reports crashes to the developers. Can include what was on screen.' }[c], todo: c === 'ads' || c === 'social pixels' ? 'A content blocker stops most of these.' : 'Normal for most sites.' });
+  }
+  const unknown = parties.filter(p => !p.category);
+  if (unknown.length) findings.push({ sev: 'info', title: `${unknown.length} other third-party host${unknown.length > 1 ? 's' : ''}`, evidence: unknown.slice(0, 15).map(p => `${p.host} (${p.count})`),
+    means: 'Not on the tracker lists: often CDNs, fonts or the site\'s own services on another domain.', todo: 'Nothing, unless one looks unfamiliar.' });
+
+  // Live fingerprinting, per script.
+  if (watcher) {
+    for (const [script, techs] of watcher.byScript()) {
+      const used = FP_TECHS.filter(t => techs.has(t) && !(t === 'font probing (measureText)' && techs.get(t) < 50));
+      if (used.length >= 3) findings.push({ sev: 'high', title: 'Likely fingerprinting your device', evidence: [script, ...used.map(t => `${t} ×${techs.get(t)}`)],
+        means: 'One script read several hard-to-change details of your device. Combined, they make an ID that works without cookies and across private windows.', todo: 'Use a browser with fingerprinting protection (Firefox strict mode, Brave, Safari).' });
+      else if (used.length) findings.push({ sev: 'info', title: 'Read some device details', evidence: [script, ...used.map(t => `${t} ×${techs.get(t)}`)],
+        means: 'Games and graphics apps read these to pick settings. One or two on their own isn\'t fingerprinting.', todo: 'Nothing.' });
+    }
+  }
+
+  // Tracking IDs stored in this browser.
+  const ids = [];
+  for (const k of storage?.localStorage ?? []) if (TRACKING_ID_KEYS.test(k.key)) ids.push(`localStorage ${k.key}`);
+  for (const c of cookies) if (TRACKING_ID_KEYS.test(c.name)) ids.push(`cookie ${c.name}`);
+  if (ids.length) findings.push({ sev: 'low', title: `${ids.length} tracking ID${ids.length > 1 ? 's' : ''} stored in your browser`, evidence: ids,
+    means: 'Long-lived IDs that let analytics and ad services recognize you on your next visit.', todo: 'Clearing this site\'s data resets them.' });
+  return findings;
+}
+
+// ---- security/secrets.js ----
+// Tokens and secrets that page scripts can read. Values are always masked (first 4 + last 2 characters): the point is
+// to show that a secret is exposed and where, never to copy it.
+
+const mask = s => s.length <= 8 ? '•'.repeat(s.length) : `${s.slice(0, 4)}…${s.slice(-2)} (${s.length} chars)`;
+
+function b64urlJson(part) {
+  try { return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '='))); } catch { return null; }
+}
+
+function readCookies() {
+  if (!document.cookie) return [];
+  return document.cookie.split(/;\s*/).map(c => { const i = c.indexOf('='); return { name: c.slice(0, i), value: c.slice(i + 1) }; });
+}
+
+// sources: [{ where, text, kind }] kind = 'storage' | 'cookie' | 'code'
+function secretFindings(sources, cookies) {
+  const findings = [], seen = new Set();
+  for (const { where, text, kind, key } of sources) {
+    if (!text) continue;
+    // An opaque token stored under a token-like name (access_token, auth, session...): readable by any script.
+    if (kind === 'storage' && key && SESSION_COOKIE.test(key) && !NOT_SESSION_COOKIE.test(key) && /^[\w\-.~+/=]{20,}$/.test(text) && !new RegExp(JWT.source).test(text)) {
+      findings.push({ sev: 'medium', title: `Token-like value in ${where.split('[')[0]}`, evidence: [mask(text), where],
+        means: 'Something stored under a login/session name. Storage like this can be read by any script on the page, so an XSS bug can steal it.',
+        todo: 'If it\'s your app: keep session tokens in HttpOnly, Secure, SameSite cookies.' });
+    }
+    for (const p of SECRET_PATTERNS) {
+      for (const m of text.matchAll(p.re)) {
+        const key = p.name + m[0];
+        if (seen.has(key)) continue; seen.add(key);
+        findings.push({ sev: p.sev, title: `${p.name} in ${kind === 'code' ? 'the page\'s code' : kind}`, evidence: [mask(m[0]), where],
+          means: p.means + (kind === 'code' ? ' It ships to every visitor in the page\'s code.' : ''),
+          todo: p.sev === 'info' ? 'Check the key is restricted to this site.' : 'If it\'s your site: revoke this key now, then move it to the server. Anything sent to a browser is public.' });
+      }
+    }
+    for (const m of text.matchAll(JWT)) {
+      const token = m[0];
+      if (seen.has(token)) continue; seen.add(token);
+      const [h, p] = token.split('.');
+      const header = b64urlJson(h), claims = b64urlJson(p);
+      if (!header) continue;
+      const alg = String(header.alg ?? '?');
+      const exp = typeof claims?.exp === 'number' ? new Date(claims.exp * 1000) : null;
+      const facts = [`alg: ${alg}`, exp ? `expires ${exp.toISOString().slice(0, 10)}${exp < new Date() ? ' (expired)' : ''}` : 'no expiry', claims?.iss ? `issuer: ${claims.iss}` : null,
+        claims ? `claims: ${Object.keys(claims).slice(0, 8).join(', ')}` : null].filter(Boolean);
+      const none = alg.toLowerCase() === 'none';
+      findings.push({ sev: none ? 'high' : kind === 'code' ? 'medium' : 'medium', title: `Login token (JWT) in ${kind === 'code' ? 'the page\'s code' : kind}`,
+        evidence: [mask(token), where, ...facts],
+        means: (none ? 'Its algorithm is "none": it has no signature, so if the server accepts it, anyone can forge one. ' : '') +
+          (kind === 'storage' ? 'Tokens in localStorage/sessionStorage can be read by any script on the page, so a single XSS bug or bad third-party script can steal the session.' :
+            kind === 'cookie' ? 'This cookie isn\'t HttpOnly, so page scripts (and XSS) can read it.' : 'A token hard-coded in shipped code works for anyone who reads the code.'),
+        todo: none ? 'If it\'s your app: make the server reject alg "none" and always verify signatures.' : 'If it\'s your app: keep session tokens in HttpOnly, Secure, SameSite cookies.' });
+    }
+  }
+  // Session cookies readable by JS (HttpOnly cookies never appear in document.cookie, so these are the exposed ones).
+  for (const c of cookies) {
+    if (!SESSION_COOKIE.test(c.name) || NOT_SESSION_COOKIE.test(c.name) || new RegExp(JWT.source).test(c.value)) continue; // JWTs reported above
+    findings.push({ sev: 'medium', title: `Session cookie "${c.name}" is readable by scripts`, evidence: [mask(c.value), 'document.cookie'],
+      means: 'It isn\'t marked HttpOnly, so any script on the page (including an XSS attack) can read and steal it.', todo: 'If it\'s your site: set HttpOnly (and Secure, SameSite) on session cookies.' });
+  }
+  return findings;
+}
+
+// Everything secrets can hide in, gathered from the page. scriptTexts = [[where, text]] already fetched for hints.
+function secretSources({ cookies, scriptTexts, files }) {
+  const sources = [];
+  for (const c of cookies) sources.push({ where: `cookie ${c.name}`, text: c.value, kind: 'cookie' });
+  for (const [store, label] of [[window.localStorage, 'localStorage'], [window.sessionStorage, 'sessionStorage']]) {
+    try { for (let i = 0; i < store.length; i++) { const k = store.key(i); sources.push({ where: `${label}["${k}"]`, text: store.getItem(k), kind: 'storage', key: k }); } } catch {}
+  }
+  [...document.scripts].filter(s => !s.src).forEach((s, i) => sources.push({ where: `inline <script> #${i + 1}`, text: s.textContent, kind: 'code' }));
+  for (const [where, text] of scriptTexts) sources.push({ where, text, kind: 'code' });
+  for (const f of files.filter(x => x.mod)) {
+    const strings = findStrings(f.mod, { minLength: 16, filter: /AKIA|ASIA|_live_|_test_|gh[pousr]_|github_pat_|xox[baprs]-|sk-|AIza|PRIVATE KEY|eyJ/, limit: 200 }).strings;
+    sources.push({ where: f.url.split('/').pop(), text: strings.join('\n'), kind: 'code' });
+  }
+  for (const name of Object.getOwnPropertyNames(window)) {
+    let v; try { v = window[name]; } catch { continue; }
+    if (typeof v === 'string' && v.length >= 16 && v.length < 10000) sources.push({ where: `window.${name}`, text: v, kind: 'code' });
+  }
+  return sources;
+}
+
 // ---- main.js ----
 // EngineX-ray: click the bookmark on a browser game and see what's under the hood.
 // Built by make.sh into one script (engine-xray.js) and a bookmarklet; the modules above are pasted in front of this.
@@ -404,6 +841,8 @@ function consoleRecorder(max = 3000) {
 
   const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
   const recorder = consoleRecorder();
+  const watcher = createWatcher();
+  state.security = null;
 
   // ---- panel shell ----
   const host = document.createElement('div');
@@ -442,6 +881,11 @@ function consoleRecorder(max = 3000) {
     td:first-child { font: 12px ui-monospace, Menlo, monospace; color: #fff; white-space: nowrap; }
     .tip { border-left: 3px solid #5cf2c8; padding: 4px 0 4px 9px; margin: 6px 0; }
     .lvl-warn { color: #ffcc66; } .lvl-error { color: #ff7a7a; }
+    .finding { border-left: 4px solid #8a8f99; }
+    .finding.high { border-left-color: #ff5c5c; } .finding.medium { border-left-color: #ffb347; } .finding.low { border-left-color: #ffe066; }
+    .sev { display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .5px; padding: 1px 7px; border-radius: 4px; margin-right: 6px; background: #2c2f36; color: #c8cbd1; text-transform: uppercase; }
+    .sev.high { background: #ff5c5c; color: #160404; } .sev.medium { background: #ffb347; color: #1a0f00; } .sev.low { background: #ffe066; color: #1a1500; }
+    .summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; } .watching { color: #5cf2c8; font-weight: 700; }
   </style>
   <div class="panel">
     <header><b>EngineX-ray</b><span class="status">scanning…</span><button class="close" title="Close">✕</button></header>
@@ -462,14 +906,14 @@ function consoleRecorder(max = 3000) {
   });
   $('.close').onclick = () => $('.panel').classList.add('hidden');
 
-  const TABS = { overview: 'Overview', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
+  const TABS = { overview: 'Overview', security: 'Security', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
   function renderNav() {
     $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}</button>`).join('');
     $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; render(); });
   }
   function render() {
     renderNav();
-    const view = { overview, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
+    const view = { overview, security, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
     $('main').innerHTML = view();
     wire[state.tab]?.();
   }
@@ -494,6 +938,7 @@ function consoleRecorder(max = 3000) {
     for (const url of wasmUrls()) await addWasm(url);
     state.hints = await scriptHints();
     state.storage = await storageReport();
+    runSecurity();
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
     render();
   }
@@ -527,6 +972,10 @@ function consoleRecorder(max = 3000) {
       h += unscanned.map((x, i) => `<div class="row"><span class="mono">${esc(x.raw)}</span><span class="dim">in ${esc(x.from)}${x.guessed ? ' · name is a guess (built at runtime)' : ''}</span><button class="btn hint" data-i="${state.hints.wasm.indexOf(x)}">Scan</button></div>`).join('');
       if (state.hints.workers.length) h += `<div class="dim">Web workers: ${state.hints.workers.map(w => `<code>${esc(w)}</code>`).join(', ')}. Engines often run inside these, which is why their files don't show up in the page's list.</div>`;
       h += `</div>`;
+    }
+    if (state.security) {
+      const c = severityCounts(allFindings());
+      h += `<div class="card"><b>Security:</b> ${['high', 'medium', 'low'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join(' ')} <span class="dim">· see the Security tab</span></div>`;
     }
     h += `<h3>Where to start</h3>${tips().map(t => `<div class="tip">${t}</div>`).join('') || '<div class="dim">Nothing stood out yet.</div>'}`;
     h += `<h3>Scan another engine file</h3><div class="row"><input type="text" class="url" placeholder="https://…/game.wasm"><button class="btn add">Scan</button><button class="btn ghost pick">From file…</button><input type="file" class="file" accept=".wasm" hidden></div>`;
@@ -668,6 +1117,12 @@ function consoleRecorder(max = 3000) {
     const s = state.storage;
     if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
       ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
+    if (state.security) {
+      lines.push('## Security findings', '', '_Secret values are masked._', '');
+      for (const [section, list] of Object.entries(state.security)) {
+        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.join('; ')}`) : ['- nothing found']), '');
+      }
+    }
     lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
     return lines.join('\n');
   }
@@ -684,9 +1139,52 @@ function consoleRecorder(max = 3000) {
     };
   };
 
+  // ---- security ----
+  const SEV_ORDER = { high: 0, medium: 1, low: 2, info: 3 };
+  const sortFindings = list => [...list].sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
+  const allFindings = () => Object.values(state.security ?? {}).flat();
+  const severityCounts = list => list.reduce((c, f) => (c[f.sev]++, c), { high: 0, medium: 0, low: 0, info: 0 });
+  function runSecurity() { watcher.quietly(runSecurityNow); }
+  function runSecurityNow() {
+    const cookies = readCookies();
+    const texts = state.hints.texts ?? [];
+    state.security = {
+      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
+      'Privacy': privacyFindings({ watcher, storage: state.storage, cookies }),
+      'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
+    };
+  }
+  const liveRefresh = debounce(() => { runSecurity(); if (state.tab === 'security' || state.tab === 'overview') render(); }, 600);
+  watcher.onChange(liveRefresh);
+
+  function security() {
+    if (!state.security) return '<div class="dim">Scanning…</div>';
+    const c = severityCounts(allFindings());
+    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Watch this page'}</button>
+      ${watcher.on ? `<span class="watching">● watching</span> <span class="dim">${watcher.events.length} API calls · ${watcher.sockets.length} sockets · ${watcher.workers.length} workers</span>` : ''}
+      <button class="btn ghost rerun">Rescan</button></div>
+      <div class="dim">Watching records fingerprinting calls, WebSocket connections and new workers <b>from the moment you switch it on</b>. Switch it on, then use the page (press Play, log in, scroll). It never blocks or changes anything.</div></div>
+      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
+    for (const [section, list] of Object.entries(state.security)) {
+      h += `<h3>${esc(section)}</h3>`;
+      if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
+      for (const f of sortFindings(list)) {
+        h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
+          <div class="list dim">${f.evidence.map(esc).join('\n')}</div>
+          <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
+      }
+    }
+    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores. It sends nothing and probes nothing. Secret values are masked.</p>`;
+    return h;
+  }
+  wire.security = () => {
+    $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
+    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); runSecurity(); render(); };
+  };
+
   window.EngineXray = {
     toggle() { $('.panel').classList.toggle('hidden'); },
-    state, rescan: scan, report: reportMarkdown,
+    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { state.tab = t; render(); },
     addWasm: async (url, bytes) => { await addWasm(url, bytes); render(); },
   };
   render();

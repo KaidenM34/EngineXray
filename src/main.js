@@ -11,6 +11,8 @@
 
   const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
   const recorder = consoleRecorder();
+  const watcher = createWatcher();
+  state.security = null;
 
   // ---- panel shell ----
   const host = document.createElement('div');
@@ -49,6 +51,11 @@
     td:first-child { font: 12px ui-monospace, Menlo, monospace; color: #fff; white-space: nowrap; }
     .tip { border-left: 3px solid #5cf2c8; padding: 4px 0 4px 9px; margin: 6px 0; }
     .lvl-warn { color: #ffcc66; } .lvl-error { color: #ff7a7a; }
+    .finding { border-left: 4px solid #8a8f99; }
+    .finding.high { border-left-color: #ff5c5c; } .finding.medium { border-left-color: #ffb347; } .finding.low { border-left-color: #ffe066; }
+    .sev { display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .5px; padding: 1px 7px; border-radius: 4px; margin-right: 6px; background: #2c2f36; color: #c8cbd1; text-transform: uppercase; }
+    .sev.high { background: #ff5c5c; color: #160404; } .sev.medium { background: #ffb347; color: #1a0f00; } .sev.low { background: #ffe066; color: #1a1500; }
+    .summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; } .watching { color: #5cf2c8; font-weight: 700; }
   </style>
   <div class="panel">
     <header><b>EngineX-ray</b><span class="status">scanning…</span><button class="close" title="Close">✕</button></header>
@@ -69,14 +76,14 @@
   });
   $('.close').onclick = () => $('.panel').classList.add('hidden');
 
-  const TABS = { overview: 'Overview', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
+  const TABS = { overview: 'Overview', security: 'Security', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
   function renderNav() {
     $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}</button>`).join('');
     $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; render(); });
   }
   function render() {
     renderNav();
-    const view = { overview, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
+    const view = { overview, security, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
     $('main').innerHTML = view();
     wire[state.tab]?.();
   }
@@ -101,6 +108,7 @@
     for (const url of wasmUrls()) await addWasm(url);
     state.hints = await scriptHints();
     state.storage = await storageReport();
+    runSecurity();
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
     render();
   }
@@ -134,6 +142,10 @@
       h += unscanned.map((x, i) => `<div class="row"><span class="mono">${esc(x.raw)}</span><span class="dim">in ${esc(x.from)}${x.guessed ? ' · name is a guess (built at runtime)' : ''}</span><button class="btn hint" data-i="${state.hints.wasm.indexOf(x)}">Scan</button></div>`).join('');
       if (state.hints.workers.length) h += `<div class="dim">Web workers: ${state.hints.workers.map(w => `<code>${esc(w)}</code>`).join(', ')}. Engines often run inside these, which is why their files don't show up in the page's list.</div>`;
       h += `</div>`;
+    }
+    if (state.security) {
+      const c = severityCounts(allFindings());
+      h += `<div class="card"><b>Security:</b> ${['high', 'medium', 'low'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join(' ')} <span class="dim">· see the Security tab</span></div>`;
     }
     h += `<h3>Where to start</h3>${tips().map(t => `<div class="tip">${t}</div>`).join('') || '<div class="dim">Nothing stood out yet.</div>'}`;
     h += `<h3>Scan another engine file</h3><div class="row"><input type="text" class="url" placeholder="https://…/game.wasm"><button class="btn add">Scan</button><button class="btn ghost pick">From file…</button><input type="file" class="file" accept=".wasm" hidden></div>`;
@@ -275,6 +287,12 @@
     const s = state.storage;
     if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
       ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
+    if (state.security) {
+      lines.push('## Security findings', '', '_Secret values are masked._', '');
+      for (const [section, list] of Object.entries(state.security)) {
+        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.join('; ')}`) : ['- nothing found']), '');
+      }
+    }
     lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
     return lines.join('\n');
   }
@@ -291,9 +309,52 @@
     };
   };
 
+  // ---- security ----
+  const SEV_ORDER = { high: 0, medium: 1, low: 2, info: 3 };
+  const sortFindings = list => [...list].sort((a, b) => SEV_ORDER[a.sev] - SEV_ORDER[b.sev]);
+  const allFindings = () => Object.values(state.security ?? {}).flat();
+  const severityCounts = list => list.reduce((c, f) => (c[f.sev]++, c), { high: 0, medium: 0, low: 0, info: 0 });
+  function runSecurity() { watcher.quietly(runSecurityNow); }
+  function runSecurityNow() {
+    const cookies = readCookies();
+    const texts = state.hints.texts ?? [];
+    state.security = {
+      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
+      'Privacy': privacyFindings({ watcher, storage: state.storage, cookies }),
+      'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
+    };
+  }
+  const liveRefresh = debounce(() => { runSecurity(); if (state.tab === 'security' || state.tab === 'overview') render(); }, 600);
+  watcher.onChange(liveRefresh);
+
+  function security() {
+    if (!state.security) return '<div class="dim">Scanning…</div>';
+    const c = severityCounts(allFindings());
+    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Watch this page'}</button>
+      ${watcher.on ? `<span class="watching">● watching</span> <span class="dim">${watcher.events.length} API calls · ${watcher.sockets.length} sockets · ${watcher.workers.length} workers</span>` : ''}
+      <button class="btn ghost rerun">Rescan</button></div>
+      <div class="dim">Watching records fingerprinting calls, WebSocket connections and new workers <b>from the moment you switch it on</b>. Switch it on, then use the page (press Play, log in, scroll). It never blocks or changes anything.</div></div>
+      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
+    for (const [section, list] of Object.entries(state.security)) {
+      h += `<h3>${esc(section)}</h3>`;
+      if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
+      for (const f of sortFindings(list)) {
+        h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
+          <div class="list dim">${f.evidence.map(esc).join('\n')}</div>
+          <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
+      }
+    }
+    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores. It sends nothing and probes nothing. Secret values are masked.</p>`;
+    return h;
+  }
+  wire.security = () => {
+    $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
+    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); runSecurity(); render(); };
+  };
+
   window.EngineXray = {
     toggle() { $('.panel').classList.toggle('hidden'); },
-    state, rescan: scan, report: reportMarkdown,
+    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { state.tab = t; render(); },
     addWasm: async (url, bytes) => { await addWasm(url, bytes); render(); },
   };
   render();

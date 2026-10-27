@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 python3 -I - <<'PYEOF'
 import html, pathlib, re, urllib.parse
 parts = []
-for name in ['wasm.js', 'detect.js', 'page.js']:
+for name in ['wasm.js', 'detect.js', 'page.js', 'security/lists.js', 'security/hooks.js', 'security/miner.js', 'security/privacy.js', 'security/secrets.js']:
     src = pathlib.Path('src', name).read_text()
     parts.append(f'// ---- {name} ----\n' + re.sub(r'^export ', '', src, flags=re.M))
 parts.append('// ---- main.js ----\n' + pathlib.Path('src/main.js').read_text())
@@ -19,5 +19,6 @@ bookmarklet = 'javascript:' + urllib.parse.quote(squeeze(bundle), safe='')
 pathlib.Path('enginexray.bookmarklet.txt').write_text(bookmarklet)
 page = pathlib.Path('install.template.html').read_text().replace('{{BOOKMARKLET}}', html.escape(bookmarklet, quote=True))
 pathlib.Path('install.html').write_text(page)
+pathlib.Path('lab/engine-xray.js').write_text(bundle)  # the test range loads it too
 print('built engine-xray.js', len(bundle), 'chars | bookmarklet', len(bookmarklet), 'chars')
 PYEOF

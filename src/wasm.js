@@ -47,7 +47,7 @@ export function parseWasm(buffer) {
   r.pos = 8;
   const out = {
     size: bytes.length, version, imports: [], exports: [], memories: [], tables: 0, globals: 0,
-    functions: { imported: 0, defined: 0 }, customSections: [], data: [], dataBytes: 0, functionNames: 0,
+    functions: { imported: 0, defined: 0 }, customSections: [], data: [], dataBytes: 0, functionNames: 0, names: [],
     sections: [],
   };
   while (r.pos < bytes.length) {
@@ -57,7 +57,7 @@ export function parseWasm(buffer) {
       if (id === 0) {
         const name = r.name();
         out.customSections.push({ name, size: end - r.pos });
-        if (name === 'name') out.functionNames = countFunctionNames(r, end);
+        if (name === 'name') { out.names = readFunctionNames(r, end); out.functionNames = out.names.length; }
       } else if (id === 2) {
         for (let n = r.u32(); n--;) {
           const module = r.name(), field = r.name(), kind = r.byte();
@@ -102,14 +102,19 @@ export function parseWasm(buffer) {
   return out;
 }
 
-// The "name" custom section: subsection 1 lists function names (debug builds and many engines keep it).
-function countFunctionNames(r, end) {
+// The "name" custom section: subsection 1 lists function names (debug builds and many engines keep it). Capped so a
+// huge debug build doesn't hold hundreds of thousands of strings.
+function readFunctionNames(r, end, cap = 200000) {
   while (r.pos < end) {
     const sub = r.byte(), len = r.u32(), next = r.pos + len;
-    if (sub === 1) return r.u32();
+    if (sub === 1) {
+      const names = [];
+      for (let n = r.u32(); n-- && names.length < cap;) { r.u32(); names.push(r.name()); }
+      return names;
+    }
     r.pos = next;
   }
-  return 0;
+  return [];
 }
 
 // Printable ASCII runs inside the data segments (where C/C++/Rust string literals end up), or the whole file if a

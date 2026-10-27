@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Range: Hidden Miner</title>
+<link rel="stylesheet" href="lab.css">
+</head>
+<body>
+<main>
+  <a class="back" href="index.html">← Test range</a><br>
+  <span class="tag red">Crypto-miner</span>
+  <h1>Hidden miner</h1>
+  <p class="lede">A real browser miner borrows your CPU to earn cryptocurrency for someone else. This page fakes every sign of one, without mining anything.</p>
+
+  <h3>Planted on this page</h3>
+  <ul class="planted">
+    <li><code>fake-miner.wasm</code> with Keccak round constants, the AES S-box and BLAKE-256 values: the CryptoNight recipe</li>
+    <li>Miner function names and a pool address inside that file</li>
+    <li>One web worker per CPU core, the way miners use the whole processor</li>
+    <li>A WebSocket to a fake pool that sends <code>login</code> and receives a <code>job</code> (the stratum protocol)</li>
+  </ul>
+
+  <h3>Try it</h3>
+  <ol class="steps">
+    <li>Click the EngineX-ray bookmark. The Security tab already flags the wasm file.</li>
+    <li>In the Security tab, click <b>Watch this page</b>.</li>
+    <li>Click the red button. Watch the pool connection and worker swarm show up.</li>
+  </ol>
+  <button class="run" id="go">Start fake mining</button>
+  <div class="log" id="log">Loading fake-miner.wasm…</div>
+</main>
+<script src="miner-page.js"></script>
+<script src="xray-button.js"></script>
+</body>
+</html>

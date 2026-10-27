@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EngineX-ray Test Range</title>
+<link rel="stylesheet" href="lab.css">
+</head>
+<body>
+<main>
+  <span class="tag">EngineX-ray · test range</span>
+  <h1>Fake threats, <span>real detection.</span></h1>
+  <p class="lede">Each page below hides one kind of web threat on purpose. Open it, click the EngineX-ray bookmark, and see what the Security tab catches.</p>
+
+  <div class="grid">
+    <div class="card">
+      <span class="tag red">Crypto-miner</span>
+      <h2>Hidden miner</h2>
+      <p>A WebAssembly file carrying CryptoNight's crypto tables, a worker per CPU core, and a connection to a "mining pool" speaking the stratum protocol.</p>
+      <a class="go" href="miner.html">Open →</a>
+    </div>
+    <div class="card">
+      <span class="tag amber">Privacy</span>
+      <h2>Device fingerprinting</h2>
+      <p>One script that quietly reads your canvas, GPU model, audio stack, fonts and hardware to build an ID that survives clearing cookies.</p>
+      <a class="go" href="fingerprint.html">Open →</a>
+    </div>
+    <div class="card">
+      <span class="tag red">Secrets</span>
+      <h2>Leaky login app</h2>
+      <p>A forgeable login token in localStorage, a session cookie scripts can read, and a cloud key shipped in the page's code.</p>
+      <a class="go" href="secrets.html">Open →</a>
+    </div>
+    <div class="card">
+      <span class="tag">Control</span>
+      <h2>Clean page</h2>
+      <p>Nothing planted. EngineX-ray should report nothing above "info" here. This is how false positives get caught.</p>
+      <a class="go" href="clean.html">Open →</a>
+    </div>
+  </div>
+
+  <div class="safe"><b>Everything here is fake and harmless.</b> The "miner" has no code at all, just the data tables a real one carries. The pool is a few lines of Python on this computer. Every key is a made-up value or AWS's own documentation example. Nothing leaves your machine.</div>
+</main>
+</body>
+</html>

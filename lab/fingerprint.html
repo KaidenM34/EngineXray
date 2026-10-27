@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Range: Device Fingerprinting</title>
+<link rel="stylesheet" href="lab.css">
+</head>
+<body>
+<main>
+  <a class="back" href="index.html">← Test range</a><br>
+  <span class="tag amber">Privacy</span>
+  <h1>Device fingerprinting</h1>
+  <p class="lede">Cookies can be cleared. A fingerprint can't: it's built from tiny differences in how your device draws, plays sound and reports its hardware. This page runs the classic techniques from one script, <code>fp.js</code>.</p>
+
+  <h3>Planted on this page</h3>
+  <ul class="planted">
+    <li>Canvas fingerprint: draw text and shapes, read the pixels back</li>
+    <li>Font probing: measure the same text in 60 fonts to see which you have</li>
+    <li>GPU model via WebGL's debug renderer info</li>
+    <li>Audio fingerprint via an <code>OfflineAudioContext</code></li>
+    <li>Hardware details: CPU cores, memory, plugins</li>
+  </ul>
+
+  <h3>Try it</h3>
+  <ol class="steps">
+    <li>Click the EngineX-ray bookmark, open the Security tab, and click <b>Watch this page</b>.</li>
+    <li>Click the red button.</li>
+    <li>EngineX-ray names <code>fp.js</code> as fingerprinting you, with the list of techniques.</li>
+  </ol>
+  <button class="run" id="go">Fingerprint me</button>
+  <div class="log" id="log">Ready.</div>
+</main>
+<script src="fp.js"></script>
+<script src="xray-button.js"></script>
+</body>
+</html>

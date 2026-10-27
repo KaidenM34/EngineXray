@@ -10,22 +10,33 @@ export function wasmUrls() {
 // Engine files the page's own scripts mention, for games that load their engine inside a worker or build the URL at
 // runtime (both hide it from the resource list). Template parts like `${hash}` are dropped, so the guess is the plain
 // file name; the panel offers it as a one-click scan and says it's a guess.
+// EngineX-ray's own file, when it's loaded as a script (the test range does this). Its detection lists contain miner
+// and tracker names, so it must never scan itself.
+export const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
+
 export async function scriptHints() {
   const scripts = performance.getEntriesByType('resource')
     .filter(e => e.initiatorType === 'script' && new URL(e.name).origin === location.origin).map(e => e.name);
   for (const s of document.scripts) if (s.src && new URL(s.src).origin === location.origin) scripts.push(s.src);
-  const wasm = new Map(), workers = new Set();
-  for (const src of [...new Set(scripts)].slice(0, 25)) {
+  const wasm = new Map(), workers = new Set(), texts = [];
+  const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
+  while (queue.length && done.size < 40) {
+    const src = queue.shift();
+    if (done.has(src)) continue; done.add(src);
     let text = '';
     try { text = await (await fetch(src)).text(); } catch { continue; }
     if (text.length > 5e6) continue;
+    texts.push([src.split('/').pop().split('?')[0] || src, text]);
     for (const m of text.matchAll(/["'`]([^"'`\s]*?\.wasm)[^"'`\s]*["'`]/g)) {
       const raw = m[1], plain = raw.replace(/\$\{[^}]*\}/g, '').replace(/-+(?=\.wasm$)/, '');
       try { wasm.set(new URL(plain, src).href, { from: src.split('/').pop().split('?')[0], raw, guessed: raw !== plain }); } catch {}
     }
-    for (const m of text.matchAll(/new (?:Shared)?Worker\(\s*(?:new URL\()?\s*["'`]([^"'`]+)["'`]/g)) workers.add(m[1]);
+    for (const m of text.matchAll(/new (?:Shared)?Worker\(\s*(?:new URL\()?\s*["'`]([^"'`]+)["'`]/g)) {
+      workers.add(m[1]);
+      try { const u = new URL(m[1].replace(/\$\{[^}]*\}/g, ''), src); if (u.origin === location.origin) queue.push(u.href); } catch {} // read worker code too
+    }
   }
-  return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers] };
+  return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers], texts };
 }
 
 export async function fetchWasm(url) {
