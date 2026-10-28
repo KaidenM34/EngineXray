@@ -1148,8 +1148,13 @@ function siteSecurityFindings({ headers }) {
       else if (maxAge < 15552000) findings.push({ sev: 'info', title: 'HSTS is set but short', evidence: [hsts],
         means: 'The browser forgets the "HTTPS only" rule after less than six months.', todo: 'A max-age of a year (31536000) is the usual choice.' });
     }
-    if (!csp) findings.push({ sev: 'low', title: 'No Content Security Policy', evidence: ['Content-Security-Policy header missing'],
-      means: 'A CSP limits which scripts may run. Without one, any injected script (an XSS bug, a bad ad) runs with full access to the page.', todo: 'If it\'s your site: add a CSP, even a report-only one to start.' });
+    // A Trusted Types default policy can only exist under a CSP, even when the re-read didn't show the header.
+    const ttPolicy = !!window.trustedTypes?.defaultPolicy;
+    if (!csp && ttPolicy) findings.push({ sev: 'info', title: 'Enforces Trusted Types (has a CSP)', evidence: ['trustedTypes.defaultPolicy is set'],
+      means: 'The site runs a Content Security Policy with Trusted Types, a strong defence against XSS. Its full text wasn\'t in the re-read headers.', todo: 'Nothing.' });
+    else if (!csp) findings.push({ sev: 'low', title: 'No Content Security Policy found', evidence: ['no Content-Security-Policy header in the re-read page, no <meta> policy'],
+      means: 'A CSP limits which scripts may run. Without one, any injected script (an XSS bug, a bad ad) runs with full access to the page. EngineX-ray reads headers by re-loading the page in the background; a few sites (YouTube, for one) only send their policy on a normal visit, so check DevTools → Network if this looks wrong.',
+      todo: 'If it\'s your site: add a CSP, even a report-only one to start.' });
     else {
       const { script } = scriptPolicy(csp);
       const strong = script?.some(s => /^'(nonce-|sha256-|sha384-|sha512-|strict-dynamic)/.test(s));
@@ -1376,6 +1381,65 @@ function shortName(title) {
   return title.split(/[:(]/)[0].toLowerCase();
 }
 
+// ---- dom.js ----
+// Builds the panel's DOM from its own markup without assigning HTML strings. Sites that enforce Trusted Types
+// (YouTube) reject innerHTML outright, and sites with a sanitizing default policy (LinkedIn) strip every tag from it.
+// createElement / setAttribute / text nodes aren't affected by either, so the panel's markup is parsed here instead.
+// Only for EngineX-ray's own templates: well-formed tags, quoted attributes, page data already escaped with esc().
+
+const VOID = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ENTITY = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+const decode = s => s.indexOf('&') < 0 ? s : s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) =>
+  e[0] === '#' ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : +e.slice(1)) : ENTITY[e.toLowerCase()] ?? m);
+const TOKEN = /<!--[\s\S]*?-->|<\/([a-zA-Z][\w-]*)\s*>|<([a-zA-Z][\w-]*)((?:\s+[^\s"'>\/=]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>|([^<]+)|</g;
+const ATTR = /([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+function buildHTML(html) {
+  const root = document.createDocumentFragment();
+  const stack = [root];
+  for (const m of html.matchAll(TOKEN)) {
+    const [whole, close, open, attrs, selfClose, text] = m;
+    const parent = stack.at(-1);
+    if (text != null || whole === '<') { parent.append(decode(text ?? whole)); continue; }
+    if (close) {
+      const name = close.toLowerCase();
+      const i = stack.findLastIndex(n => n.localName === name);
+      if (i > 0) stack.length = i;
+      continue;
+    }
+    if (!open) continue; // comment
+    const name = open.toLowerCase();
+    const inSvg = name === 'svg' || parent.namespaceURI === SVG_NS;
+    const el = inSvg ? document.createElementNS(SVG_NS, open) : document.createElement(name);
+    for (const a of (attrs ?? '').matchAll(ATTR)) {
+      if (/^on/i.test(a[1])) continue; // never event-handler attributes
+      try { el.setAttribute(a[1], decode(a[2] ?? a[3] ?? a[4] ?? '')); } catch {}
+    }
+    parent.append(el);
+    if (!selfClose && !(!inSvg && VOID.has(name))) stack.push(el);
+  }
+  return root;
+}
+
+function setHTML(el, html) {
+  el.replaceChildren(buildHTML(html));
+}
+
+// Styles for a shadow root: a constructed stylesheet when the browser has them (page CSPs don't apply to those),
+// otherwise a <style> element filled as text.
+function applyStyles(shadow, css) {
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(css);
+    shadow.adoptedStyleSheets = [...shadow.adoptedStyleSheets, sheet];
+  } catch {
+    const style = document.createElement('style');
+    style.textContent = css;
+    shadow.append(style);
+  }
+}
+
 // ---- main.js ----
 // EngineX-ray: click the bookmark on any page and see how it treats you: a privacy and security report card, the
 // evidence behind it, and a live watch of where your data goes. Engine tools for WebAssembly games live under Advanced.
@@ -1400,7 +1464,7 @@ function shortName(title) {
   const host = document.createElement('div');
   host.style.cssText = 'position:fixed;top:16px;right:16px;z-index:2147483647';
   const shadow = host.attachShadow({ mode: 'open' });
-  shadow.innerHTML = `<style>
+  applyStyles(shadow, `
     :host { all: initial; }
     * { box-sizing: border-box; }
     .panel {
@@ -1478,12 +1542,12 @@ function shortName(title) {
     .ded { display: grid; grid-template-columns: 34px 1fr; gap: 4px 10px; } .ded b { color: #ff8589; text-align: right; font: 600 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
     details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 4px; } details summary:hover { color: var(--text); }
     .sub { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 12px; }
-  </style>
-  <div class="panel">
+  `);
+  shadow.append(buildHTML(`<div class="panel">
     <header><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 4.5 5.5v6c0 4.6 3.1 8.6 7.5 10 4.4-1.4 7.5-5.4 7.5-10v-6L12 2.5Z" fill="rgba(76,141,255,.18)" stroke="#4c8dff" stroke-width="1.6" stroke-linejoin="round"/><path d="m8.8 12.2 2.2 2.2 4.4-4.6" fill="none" stroke="#4c8dff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><b>EngineX-ray</b><span class="status">checking this page…</span><button class="close" title="Close" aria-label="Close">✕</button></header>
     <nav></nav>
     <main></main>
-  </div>`;
+  </div>`));
   document.documentElement.append(host);
   const $ = s => shadow.querySelector(s);
   const status = t => { $('.status').textContent = t; };
@@ -1502,13 +1566,13 @@ function shortName(title) {
   const TABS = { report: 'Report card', findings: 'Findings', watch: 'Live watch', advanced: 'Advanced', export: 'Export' };
   const ADVANCED = { overview: 'Engine', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console' };
   function renderNav() {
-    $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}${k === 'watch' && watcher.on ? ' ●' : ''}${k === 'advanced' && state.files.length ? ' ⚙' : ''}</button>`).join('');
+    setHTML($('nav'), Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}${k === 'watch' && watcher.on ? ' ●' : ''}${k === 'advanced' && state.files.length ? ' ⚙' : ''}</button>`).join(''));
     $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; if (b.dataset.tab === 'findings') state.focus = null; render(); });
   }
   function render() {
     renderNav();
     const view = { report: reportCard, findings, watch: watchTab, advanced, export: exportTab }[state.tab];
-    $('main').innerHTML = view();
+    setHTML($('main'), view());
     wire[state.tab]?.();
   }
   // The engine tools, one sub-tab at a time.
@@ -1662,14 +1726,14 @@ function shortName(title) {
     const run = () => {
       const files = state.files.filter(x => x.mod);
       const filter = state.stringPreset ? STRING_PRESETS[state.stringPreset] : state.stringQuery || null;
-      if (!filter) { $('.results').innerHTML = '<p class="dim">Pick a preset or type something.</p>'; return; }
+      if (!filter) { setHTML($('.results'), '<p class="dim">Pick a preset or type something.</p>'); return; }
       let h = '';
       for (const f of files) {
         const { strings, total } = findStrings(f.mod, { minLength: 4, filter, limit: 300 });
         const shown = strings.filter(s => filter instanceof RegExp ? filter.test(s) : true);
         h += `<h3>${esc(f.url.split('/').pop())}: ${shown.length}${shown.length >= 300 ? '+' : ''} matches <span class="dim">(of ${total.toLocaleString()} strings)</span></h3><div class="list">${shown.map(esc).join('\n')}</div>`;
       }
-      $('.results').innerHTML = h || '<p class="dim">No engine file scanned.</p>';
+      setHTML($('.results'), h || '<p class="dim">No engine file scanned.</p>');
     };
     shadow.querySelectorAll('.chip').forEach(c => c.onclick = () => { state.stringPreset = state.stringPreset === c.dataset.p ? null : c.dataset.p; state.stringQuery = ''; render(); });
     $('.q').oninput = debounce(e => { state.stringQuery = e.target.value; state.stringPreset = null; shadow.querySelectorAll('.chip').forEach(c => c.classList.remove('on')); run(); }, 250);
@@ -1714,7 +1778,7 @@ function shortName(title) {
     const show = () => {
       const q = $('.cq').value.toLowerCase();
       const rows = recorder.lines.filter(l => !q || l.text.toLowerCase().includes(q)).slice(-300);
-      $('.lines').innerHTML = rows.map(l => `<span class="lvl-${l.level}">${esc(l.text)}</span>`).join('\n');
+      setHTML($('.lines'), rows.map(l => `<span class="lvl-${l.level}">${esc(l.text)}</span>`).join('\n'));
     };
     $('.rec').onclick = () => { recorder.on ? recorder.stop() : recorder.start(); render(); };
     $('.clr').onclick = () => { recorder.lines.length = 0; render(); };

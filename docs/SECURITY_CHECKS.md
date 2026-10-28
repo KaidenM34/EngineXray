@@ -79,7 +79,7 @@ How well the site protects you, from the response headers and the live page.
 | **Mixed content** | Scripts, frames or requests loaded over `http://` on an HTTPS page (images: low) | medium |
 | **Known-vulnerable library** | jQuery, jQuery UI, AngularJS, Bootstrap, Lodash, Underscore, Moment, Handlebars, DOMPurify and Vue versions, from their globals or from version numbers in script URLs, checked against published CVEs (e.g. jQuery < 3.5.0: CVE-2020-11022/11023) and end-of-life versions | medium (low for denial-of-service bugs and end of life) |
 | **No HSTS** | No `Strict-Transport-Security` header on an HTTPS page | low (short max-age: info) |
-| **No Content Security Policy** | Neither a header nor a `<meta>` policy | low |
+| **No Content Security Policy** | Neither a header nor a `<meta>` policy. Headers come from a background re-read, and a few sites (YouTube) only send their policy on a normal visit, so the finding says to double-check; a page with a Trusted Types default policy (LinkedIn) is known to have one and isn't flagged | low |
 | **Weak CSP** | `'unsafe-inline'` without nonces or hashes, or a wildcard script source | low (`'unsafe-eval'`: info) |
 | **Clickjacking** | No `X-Frame-Options` and no CSP `frame-ancestors` | low |
 | **CDN scripts without integrity** | Library files from public CDNs (cdnjs, jsDelivr, unpkg, code.jquery.com, …) without an `integrity` attribute | low |

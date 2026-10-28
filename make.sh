@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 python3 -I - <<'PYEOF'
 import html, pathlib, re, urllib.parse
 parts = []
-for name in ['wasm.js', 'detect.js', 'page.js', 'security/lists.js', 'security/hooks.js', 'security/miner.js', 'security/privacy.js', 'security/secrets.js', 'security/web.js', 'security/grade.js']:
+for name in ['wasm.js', 'detect.js', 'page.js', 'security/lists.js', 'security/hooks.js', 'security/miner.js', 'security/privacy.js', 'security/secrets.js', 'security/web.js', 'security/grade.js', 'dom.js']:
     src = pathlib.Path('src', name).read_text()
     parts.append(f'// ---- {name} ----\n' + re.sub(r'^export ', '', src, flags=re.M))
 parts.append('// ---- main.js ----\n' + pathlib.Path('src/main.js').read_text())

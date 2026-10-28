@@ -39,8 +39,13 @@ export function siteSecurityFindings({ headers }) {
       else if (maxAge < 15552000) findings.push({ sev: 'info', title: 'HSTS is set but short', evidence: [hsts],
         means: 'The browser forgets the "HTTPS only" rule after less than six months.', todo: 'A max-age of a year (31536000) is the usual choice.' });
     }
-    if (!csp) findings.push({ sev: 'low', title: 'No Content Security Policy', evidence: ['Content-Security-Policy header missing'],
-      means: 'A CSP limits which scripts may run. Without one, any injected script (an XSS bug, a bad ad) runs with full access to the page.', todo: 'If it\'s your site: add a CSP, even a report-only one to start.' });
+    // A Trusted Types default policy can only exist under a CSP, even when the re-read didn't show the header.
+    const ttPolicy = !!window.trustedTypes?.defaultPolicy;
+    if (!csp && ttPolicy) findings.push({ sev: 'info', title: 'Enforces Trusted Types (has a CSP)', evidence: ['trustedTypes.defaultPolicy is set'],
+      means: 'The site runs a Content Security Policy with Trusted Types, a strong defence against XSS. Its full text wasn\'t in the re-read headers.', todo: 'Nothing.' });
+    else if (!csp) findings.push({ sev: 'low', title: 'No Content Security Policy found', evidence: ['no Content-Security-Policy header in the re-read page, no <meta> policy'],
+      means: 'A CSP limits which scripts may run. Without one, any injected script (an XSS bug, a bad ad) runs with full access to the page. EngineX-ray reads headers by re-loading the page in the background; a few sites (YouTube, for one) only send their policy on a normal visit, so check DevTools → Network if this looks wrong.',
+      todo: 'If it\'s your site: add a CSP, even a report-only one to start.' });
     else {
       const { script } = scriptPolicy(csp);
       const strong = script?.some(s => /^'(nonce-|sha256-|sha384-|sha512-|strict-dynamic)/.test(s));
