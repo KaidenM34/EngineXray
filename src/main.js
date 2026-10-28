@@ -1,4 +1,5 @@
-// EngineX-ray: click the bookmark on a browser game and see what's under the hood.
+// EngineX-ray: click the bookmark on any page and see how it treats you: a privacy and security report card, the
+// evidence behind it, and a live watch of where your data goes. Engine tools for WebAssembly games live under Advanced.
 // Built by make.sh into one script (engine-xray.js) and a bookmarklet; the modules above are pasted in front of this.
 
 (async () => {
@@ -11,7 +12,7 @@
   const pagesMb = p => p == null ? 'no limit' : mb(p * 65536);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, skipped: [], tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
+  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, skipped: [], tab: 'report', adv: 'overview', focus: null, stringQuery: '', stringPreset: null, onlyInteresting: true };
   const recorder = consoleRecorder();
   const watcher = createWatcher();
   state.security = null;
@@ -58,9 +59,22 @@
     .sev { display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .5px; padding: 1px 7px; border-radius: 4px; margin-right: 6px; background: #2c2f36; color: #c8cbd1; text-transform: uppercase; }
     .sev.high { background: #ff5c5c; color: #160404; } .sev.medium { background: #ffb347; color: #1a0f00; } .sev.low { background: #ffe066; color: #1a1500; }
     .summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; } .watching { color: #5cf2c8; font-weight: 700; }
+    .grade { display: flex; gap: 14px; align-items: center; }
+    .letter { width: 74px; height: 74px; flex: none; border-radius: 16px; display: grid; place-items: center; font-size: 46px; font-weight: 900; color: #0b0c0e; }
+    .letter.A { background: #5cf2c8; } .letter.B { background: #9be36b; } .letter.C { background: #ffe066; } .letter.D { background: #ffb347; } .letter.F { background: #ff5c5c; }
+    .site { font-size: 15px; font-weight: 750; color: #fff; word-break: break-all; } .score { color: #8a8f99; }
+    .said { margin: 10px 0 0; padding: 0; list-style: none; } .said li { padding: 3px 0 3px 16px; position: relative; }
+    .said li::before { content: '•'; position: absolute; left: 3px; color: #5cf2c8; }
+    .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
+    .tile { background: #15171c; border: 1px solid #23262d; border-left: 4px solid #5cf2c8; border-radius: 8px; padding: 7px 9px; cursor: pointer; text-align: left; color: inherit; font: inherit; }
+    .tile.warn { border-left-color: #ffb347; } .tile.off { border-left-color: #4a4e57; } .tile.bad { border-left-color: #ff5c5c; } .tile:hover { background: #1b1e24; }
+    .tile b { display: block; font-size: 12px; color: #c8cbd1; } .tile span { font-size: 12px; color: #8a8f99; }
+    .ded { display: grid; grid-template-columns: 38px 1fr; gap: 2px 8px; } .ded b { color: #ff7a7a; text-align: right; }
+    details summary { cursor: pointer; color: #8a8f99; font-size: 12px; margin-top: 4px; }
+    .sub { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
   </style>
   <div class="panel">
-    <header><b>EngineX-ray</b><span class="status">scanning…</span><button class="close" title="Close">✕</button></header>
+    <header><b>EngineX-ray</b><span class="status">checking this page…</span><button class="close" title="Close">✕</button></header>
     <nav></nav>
     <main></main>
   </div>`;
@@ -78,18 +92,28 @@
   });
   $('.close').onclick = () => $('.panel').classList.add('hidden');
 
-  const TABS = { overview: 'Overview', security: 'Security', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
+  const wire = {}; // per-tab event wiring, run after each render
+  const TABS = { report: 'Report card', findings: 'Findings', watch: 'Live watch', advanced: 'Advanced', export: 'Export' };
+  const ADVANCED = { overview: 'Engine', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console' };
   function renderNav() {
-    $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}</button>`).join('');
-    $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; render(); });
+    $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}${k === 'watch' && watcher.on ? ' ●' : ''}${k === 'advanced' && state.files.length ? ' ⚙' : ''}</button>`).join('');
+    $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; if (b.dataset.tab === 'findings') state.focus = null; render(); });
   }
   function render() {
     renderNav();
-    const view = { overview, security, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
+    const view = { report: reportCard, findings, watch: watchTab, advanced, export: exportTab }[state.tab];
     $('main').innerHTML = view();
     wire[state.tab]?.();
   }
-  const wire = {};
+  // The engine tools, one sub-tab at a time.
+  function advanced() {
+    const views = { overview, wasm, strings, globals, storage, console: consoleTab };
+    return `<div class="sub">${Object.entries(ADVANCED).map(([k, v]) => `<button class="chip ${state.adv === k ? 'on' : ''}" data-adv="${k}">${v}</button>`).join('')}</div>` + views[state.adv]();
+  }
+  wire.advanced = () => {
+    shadow.querySelectorAll('[data-adv]').forEach(b => b.onclick = () => { state.adv = b.dataset.adv; render(); });
+    wire[state.adv]?.();
+  };
 
   // ---- scanning ----
   async function addWasm(url, bytes) {
@@ -105,8 +129,8 @@
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
   }
   // Each step has a deadline: one that runs over is skipped and listed under state.skipped, never left hanging.
-  async function step(label, work, ms, fallback) {
-    status(`${label}…`);
+  async function step(label, work, ms, fallback, announce = true) {
+    if (announce) status(`${label}…`);
     let timer;
     const late = new Promise(resolve => { timer = setTimeout(() => { state.skipped.push(label); resolve(fallback); }, ms); });
     try { return await Promise.race([work(), late]); } catch { state.skipped.push(label); return fallback; } finally { clearTimeout(timer); }
@@ -116,13 +140,22 @@
     status('reading globals…');
     try { state.globals = pageGlobals(); } catch { state.globals = []; state.skipped.push('reading globals'); }
     for (const url of wasmUrls()) await step(`reading ${url.split('/').pop().split('?')[0]}`, () => addWasm(url), 90000);
-    state.hints = await step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] });
-    state.tpTexts = await step('reading third-party scripts', thirdPartyScriptTexts, 15000, []);
-    state.storage = await step('reading storage', storageReport, 10000, { estimate: null, opfs: [], indexedDB: [], localStorage: [], caches: [] });
-    status('checking security…');
+    // These don't depend on each other, so they run side by side: the scan takes as long as the slowest one.
+    status('reading the page…');
+    [state.hints, state.tpTexts, state.storage, state.headers] = await Promise.all([
+      step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] }, false),
+      step('reading third-party scripts', thirdPartyScriptTexts, 15000, [], false),
+      step('reading storage', storageReport, 25000, { estimate: null, opfs: [], indexedDB: [], localStorage: [], caches: [] }, false),
+      step('reading security headers', pageHeaders, 9000, null, false),
+    ]);
+    status('grading…');
     runSecurity();
-    status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals${state.skipped.length ? ` · timed out: ${state.skipped.join(', ')}` : ''}`);
+    showStatus();
     render();
+  }
+
+  function showStatus() {
+    status(`${location.hostname}${state.grade ? ` · grade ${state.grade.letter}` : ''}${state.files.length ? ` · ${state.files.length} engine file${state.files.length === 1 ? '' : 's'}` : ''}${state.skipped.length ? ` · timed out: ${state.skipped.join(', ')}` : ''}`);
   }
 
   // ---- tabs ----
@@ -156,8 +189,7 @@
       h += `</div>`;
     }
     if (state.security) {
-      const c = severityCounts(allFindings());
-      h += `<div class="card"><b>Security:</b> ${['high', 'medium', 'low'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join(' ')} <span class="dim">· see the Security tab</span></div>`;
+      h += `<div class="card"><b>Report card:</b> grade ${state.grade.letter} <span class="dim">· see the Report card tab</span></div>`;
     }
     h += `<h3>Where to start</h3>${tips().map(t => `<div class="tip">${t}</div>`).join('') || '<div class="dim">Nothing stood out yet.</div>'}`;
     h += `<h3>Scan another engine file</h3><div class="row"><input type="text" class="url" placeholder="https://…/game.wasm"><button class="btn add">Scan</button><button class="btn ghost pick">From file…</button><input type="file" class="file" accept=".wasm" hidden></div>`;
@@ -285,35 +317,50 @@
     if (recorder.on) { const id = setInterval(() => { if (state.tab !== 'console' || !shadow.contains($('.lines'))) return clearInterval(id); show(); }, 1000); }
   };
 
+  // ---- export ----
   function reportMarkdown() {
-    const lines = [`# EngineX-ray report: ${location.host}${location.pathname}`, '', `Scanned ${new Date().toISOString()}`, ''];
-    for (const f of state.files) {
-      if (f.error) { lines.push(`## ${f.url}`, '', `Error: ${f.error}`, ''); continue; }
-      const m = f.mod;
-      lines.push(`## ${f.url.split('/').pop()}`, '', `- Engine: **${f.engine.best}** (${(f.engine.matches[0]?.evidence ?? []).join('; ')})`,
-        `- Size: ${mb(m.size)}, ${m.functions.defined} functions, ${m.exports.length} exports, ${m.imports.length} imports`,
-        `- Memory: ${m.memories.map(x => `${pagesMb(x.min)}–${pagesMb(x.max)}${x.shared ? ' shared' : ''}`).join(', ') || 'none'}`, '');
-      for (const [label, list] of Object.entries(interestingExports(m))) if (list.length) lines.push(`### ${label}`, '', list.slice(0, 100).map(x => `- \`${x}\``).join('\n'), '');
+    const g = state.grade;
+    const lines = [`# EngineX-ray report card: ${location.host}${location.pathname}`, '', `Scanned ${new Date().toISOString()}${watcher.startedAt ? ' · Live watch on' : ''}`, ''];
+    if (g) {
+      lines.push(`## Grade ${g.letter} (${g.score}/100)`, '', ...g.summary.map(x => `- ${x}`), '');
+      if (g.deductions.length) lines.push('### Why this grade', '', ...g.deductions.map(d => `- −${d.points}: ${d.why}`), '');
     }
-    lines.push('## Interesting globals', '', ...state.globals.filter(g => g.notes.length).map(g => `- \`${g.name}\` (${g.type}): ${g.notes.join('; ')}`), '');
-    const s = state.storage;
-    if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
-      ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
     if (state.security) {
-      lines.push('## Security findings', '', '_Secret values are masked._', '');
+      lines.push('## Findings', '', '_Passive checks. Secret values are masked._', '');
       for (const [section, list] of Object.entries(state.security)) {
+        if (section === 'Live watch' && !watcher.startedAt) continue;
         lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.slice(0, 12).map(clip).join('; ')}`) : ['- nothing found']), '');
       }
     }
-    lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
+    if (watcher.startedAt) {
+      const hosts = watcher.byHost();
+      lines.push('## Where data went while watching', '', '| Server | Requests | Sent | Kind | Your typing |', '|---|---|---|---|---|',
+        ...hosts.slice(0, 40).map(h => `| ${h.host} | ${h.requests} | ${(h.bytes / 1024).toFixed(1)} KB | ${hostCategory(h.host) ?? (isThirdPartyHost(h.host) ? 'other' : 'this site')} | ${h.typed.size ? [...h.typed.keys()].join(', ') : ''} |`), '');
+    }
+    if (state.files.length) {
+      lines.push('## Engine (Advanced)', '');
+      for (const f of state.files) {
+        if (f.error) { lines.push(`### ${f.url}`, '', `Error: ${f.error}`, ''); continue; }
+        const m = f.mod;
+        lines.push(`### ${f.url.split('/').pop()}`, '', `- Engine: **${f.engine.best}** (${(f.engine.matches[0]?.evidence ?? []).join('; ')})`,
+          `- Size: ${mb(m.size)}, ${m.functions.defined} functions, ${m.exports.length} exports, ${m.imports.length} imports`,
+          `- Memory: ${m.memories.map(x => `${pagesMb(x.min)}–${pagesMb(x.max)}${x.shared ? ' shared' : ''}`).join(', ') || 'none'}`, '');
+        for (const [label, list] of Object.entries(interestingExports(m))) if (list.length) lines.push(`#### ${label}`, '', list.slice(0, 100).map(x => `- \`${x}\``).join('\n'), '');
+      }
+      lines.push('### Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '');
+    }
+    const s = state.storage;
+    if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
+      ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
+    lines.push('_Made with EngineX-ray_');
     return lines.join('\n');
   }
-  function report() {
-    return `<p>A Markdown summary of everything above, for your notes or a GitHub issue.</p>
+  function exportTab() {
+    return `<p>The report card and every finding as Markdown, for your notes, a write-up or a bug report.</p>
       <div class="row"><button class="btn copy">Copy report</button><button class="btn ghost save">Download .md</button><span class="dim done"></span></div>
       <div class="list dim">${esc(reportMarkdown())}</div>`;
   }
-  wire.report = () => {
+  wire.export = () => {
     $('.copy').onclick = async () => { try { await navigator.clipboard.writeText(reportMarkdown()); $('.done').textContent = 'Copied.'; } catch { $('.done').textContent = 'Copy blocked: use Download.'; } };
     $('.save').onclick = () => {
       const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([reportMarkdown()], { type: 'text/markdown' })), download: `enginexray-${location.host}.md` });
@@ -331,42 +378,89 @@
     const cookies = readCookies();
     const texts = state.hints.texts ?? [];
     state.security = {
-      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
       'Privacy': [...privacyFindings({ watcher, storage: state.storage, cookies }), ...staticFingerprinting([...texts, ...(state.tpTexts ?? [])])],
+      'Site security': [...siteSecurityFindings({ headers: state.headers }), ...libraryFindings()],
       'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
+      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
+      'Live watch': watchFindings(watcher),
     };
+    state.grade = gradeReport(state.security, thirdParties());
   }
-  const liveRefresh = debounce(() => { runSecurity(); if (state.tab === 'security' || state.tab === 'overview') render(); }, 600);
+  const liveRefresh = debounce(() => { if (!state.security) return; runSecurity(); showStatus(); if (['report', 'findings', 'watch'].includes(state.tab)) render(); }, 700);
   watcher.onChange(liveRefresh);
 
-  function security() {
-    if (!state.security) return '<div class="dim">Scanning…</div>';
-    const c = severityCounts(allFindings());
-    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Watch this page'}</button>
-      ${watcher.on ? `<span class="watching">● watching</span> <span class="dim">${watcher.events.length} API calls · ${watcher.sockets.length} sockets · ${watcher.workers.length} workers</span>` : ''}
-      <button class="btn ghost rerun">Rescan</button></div>
-      <div class="dim">Watching records fingerprinting calls, WebSocket connections and new workers <b>from the moment you switch it on</b>. Switch it on, then use the page (press Play, log in, scroll). It never blocks or changes anything.</div></div>
-      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
-    for (const [section, list] of Object.entries(state.security)) {
-      h += `<h3>${esc(section)}</h3>`;
-      if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
-      for (const f of sortFindings(list)) {
-        h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
-          <div class="list dim">${f.evidence.slice(0, 12).map(e => esc(clip(e))).join('\n')}</div>
-          <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
-      }
-    }
-    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores. It sends nothing and probes nothing. Secret values are masked.</p>`;
+  const findingCard = f => {
+    const ev = f.evidence.slice(0, 12).map(e => esc(clip(e)));
+    return `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
+      <div class="list dim">${ev.slice(0, 3).join('\n')}</div>${ev.length > 3 ? `<details><summary>${ev.length - 3} more</summary><div class="list dim">${ev.slice(3).join('\n')}</div></details>` : ''}
+      <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
+  };
+
+  // The report card: grade, summary, the areas at a glance, and why points were taken off.
+  function reportCard() {
+    const g = state.grade;
+    if (!g) return '<div class="dim">Checking this page…</div>';
+    let h = `<div class="card"><div class="grade"><div class="letter ${g.letter}">${g.letter}</div>
+        <div><div class="site">${esc(location.hostname)}</div><div class="score">${g.score}/100 · how this page treats your privacy and security</div></div></div>
+        <ul class="said">${g.summary.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>
+      <div class="tiles">${g.tiles.map(t => `<button class="tile ${t.state}" data-area="${t.area}"><b>${esc(t.label)}</b><span>${esc(t.text)}</span></button>`).join('')}</div>`;
+    h += `<h3>Why this grade</h3>`;
+    h += g.deductions.length ? `<div class="card ded">${g.deductions.map(d => `<b>−${d.points}</b><span>${esc(d.why)}</span>`).join('')}</div>` : '<div class="card ok">Nothing to take points off for.</div>';
+    h += `<div class="row"><button class="btn ghost rerun">Rescan</button>${watcher.on ? '' : '<button class="btn gowatch">Start Live watch</button>'}</div>
+      <p class="dim">Measured before you accept any cookie banner, from what this tab already loaded. ${watcher.startedAt ? 'Includes what Live watch saw.' : 'Live watch adds what happens while you use the page (typing, forms, data sent).'} Nothing is sent anywhere; secrets are masked.</p>`;
     return h;
   }
-  wire.security = () => {
-    $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
-    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); state.tpTexts = await thirdPartyScriptTexts(); runSecurity(); render(); };
+  wire.report = () => {
+    if (!state.grade) return;
+    shadow.querySelectorAll('.tile').forEach(t => t.onclick = () => { if (t.dataset.area === 'watch') state.tab = 'watch'; else { state.tab = 'findings'; state.focus = t.dataset.area; } render(); });
+    $('.rerun').onclick = async () => { await scan(); };
+    $('.gowatch') && ($('.gowatch').onclick = () => { watcher.start(); state.tab = 'watch'; render(); });
   };
+
+  // Which findings sections a report-card tile opens.
+  const AREA_SECTIONS = { recording: ['Privacy'], fingerprinting: ['Privacy'], trackers: ['Privacy'], site: ['Site security'], leaks: ['Secrets & tokens'], miner: ['Crypto-miner'] };
+  function findings() {
+    if (!state.security) return '<div class="dim">Checking this page…</div>';
+    const sections = Object.entries(state.security).filter(([name]) => (!state.focus || AREA_SECTIONS[state.focus]?.includes(name)) && (name !== 'Live watch' || watcher.startedAt));
+    const c = severityCounts(sections.flatMap(([, l]) => l));
+    let h = `<div class="row">${state.focus ? `<button class="chip on all">Showing ${esc(AREA_SECTIONS[state.focus].join(', '))} · show all</button>` : ''}<button class="btn ghost rerun">Rescan</button></div>
+      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
+    for (const [section, list] of sections) {
+      h += `<h3>${esc(section)}</h3>`;
+      h += list.length ? sortFindings(list).map(findingCard).join('') : `<div class="dim">Nothing found.</div>`;
+    }
+    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores, plus one re-read of this page for its headers. It probes nothing. Secret values are masked.</p>`;
+    return h;
+  }
+  wire.findings = () => {
+    if (!state.security) return;
+    $('.all') && ($('.all').onclick = () => { state.focus = null; render(); });
+    $('.rerun').onclick = async () => { await scan(); };
+  };
+
+  function watchTab() {
+    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Start watching'}</button>
+      ${watcher.on ? '<span class="watching">● watching</span>' : ''}</div>
+      <div>Use the page like you normally would: search, open menus, fill in a form with made-up details (like <code>test.person@example.com</code>). EngineX-ray checks where each request goes, whether what you typed is in it, and which outside scripts read your fields or listen to your keys.</div>
+      <div class="dim">It sees what happens from the moment you switch it on, and never blocks or changes anything.</div></div>`;
+    if (!watcher.startedAt) return h + '<div class="dim">Not watching yet.</div>';
+    const hosts = watcher.byHost();
+    h += `<div class="summary"><span class="chip">${watcher.requests.length} requests</span><span class="chip">${hosts.length} servers</span><span class="chip">${watcher.typedCount} typed values tracked</span>
+      <span class="chip">${watcher.fieldReads.length} field reads</span><span class="chip">${watcher.keyListeners.length} key listeners</span><span class="chip">${watcher.events.length} fingerprinting calls</span></div>`;
+    const live = sortFindings(state.security?.['Live watch'] ?? []).filter(f => f.sev !== 'info');
+    h += live.length ? live.map(findingCard).join('') : `<div class="card dim">Nothing worrying seen yet. Type something into the page's search box or a form to test it.</div>`;
+    h += `<h3>Where data went</h3>`;
+    h += hosts.length ? `<table>${hosts.slice(0, 60).map(x => `<tr><td>${esc(x.host)}</td><td>${x.requests} req · ${(x.bytes / 1024).toFixed(1)} KB · <span class="dim">${esc(hostCategory(x.host) ?? (isThirdPartyHost(x.host) ? 'other company' : 'this site'))}</span>${x.typed.size ? `<div class="warn">contained your ${esc([...x.typed.keys()].join(', '))}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="dim">No requests yet.</div>';
+    const fp = [...watcher.byScript()].filter(([, t]) => t.size);
+    if (fp.length) h += `<h3>Device details read</h3><table>${fp.slice(0, 20).map(([script, techs]) => `<tr><td>${esc(clip(script.split('?')[0].split('/').slice(2).join('/')))}</td><td>${[...techs].map(([t, n]) => `${esc(t)} ×${n}`).join('<br>')}</td></tr>`).join('')}</table>`;
+    if (watcher.sockets.length || watcher.workers.length) h += `<h3>Connections and workers</h3><div class="list dim">${[...watcher.sockets.map(x => `WebSocket ${x.url}`), ...watcher.workers.map(x => `Worker ${x.url}`)].map(x => esc(clip(x))).join('\n')}</div>`;
+    return h;
+  }
+  wire.watch = () => { $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); runSecurity(); render(); }; };
 
   window.EngineXray = {
     toggle() { $('.panel').classList.toggle('hidden'); },
-    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { state.tab = t; render(); },
+    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { if (ADVANCED[t]) { state.adv = t; t = 'advanced'; } state.tab = t; render(); },
     addWasm: async (url, bytes) => { await addWasm(url, bytes); render(); },
   };
   render();

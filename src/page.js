@@ -19,7 +19,11 @@ export const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 export function timedFetch(url, opts = {}, ms = 8000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
-  return fetch(url, { ...opts, signal: ctrl.signal }).then(res => {
+  // .busy marks EngineX-ray's own requests while the fetch call starts, so Live watch doesn't count them.
+  timedFetch.busy = (timedFetch.busy ?? 0) + 1;
+  let started;
+  try { started = fetch(url, { ...opts, signal: ctrl.signal }); } finally { timedFetch.busy--; }
+  return started.then(res => {
     const read = kind => () => res[kind]().finally(() => clearTimeout(timer));
     return { ok: res.ok, status: res.status, headers: res.headers, text: read('text'), arrayBuffer: read('arrayBuffer') };
   }, e => { clearTimeout(timer); throw e; });

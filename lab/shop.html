@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Range: Outdated Shop</title>
+<link rel="stylesheet" href="lab.css">
+</head>
+<body>
+<main>
+  <a class="back" href="index.html">← Test range</a><br>
+  <span class="tag amber">Site security · Live watch</span>
+  <h1>Outdated shop</h1>
+  <p class="lede">A shop page with the kind of problems real sites ship: an old library, a login form that would send your password badly, and an outside "analytics" script that copies what you type.</p>
+  <h3>Planted on this page</h3>
+  <ul class="planted">
+    <li><code>jQuery 1.12.4</code> (only its version number), a release with four published XSS and prototype-pollution bugs</li>
+    <li>A login form that submits with <code>GET</code> to a plain <code>http://</code> address (it never actually submits)</li>
+    <li>No Content Security Policy and no clickjacking protection</li>
+    <li><code>tracker.js</code> from <code>localhost</code>, another origin than this page, that reads the email and password fields and beacons them to <code>/collect</code></li>
+  </ul>
+  <h3>Try it</h3>
+  <ol class="steps">
+    <li>Click the EngineX-ray bookmark. The report card already flags the library, the form and the missing protections.</li>
+    <li>Open <b>Live watch</b> and click <b>Start watching</b>.</li>
+    <li>Type a made-up email and password below. Live watch shows the tracker reading both fields and sending them to another server.</li>
+  </ol>
+  <div class="card">
+    <form id="login" action="http://shop-login.example/login" method="get">
+      <p><label>Email<br><input type="email" name="email" autocomplete="off" placeholder="test.person@example.com" style="width:100%;padding:8px"></label></p>
+      <p><label>Password<br><input type="password" name="password" autocomplete="off" placeholder="made-up only" style="width:100%;padding:8px"></label></p>
+      <button class="run" style="background:var(--accent)">Log in (does nothing)</button>
+    </form>
+    <div class="log" id="log">The fake tracker's beacons will be listed here.</div>
+  </div>
+</main>
+<script src="shop.js"></script>
+<script src="http://localhost:8790/tracker.js"></script>
+<script src="xray-button.js"></script>
+</body>
+</html>

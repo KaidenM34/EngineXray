@@ -50,7 +50,9 @@ export function privacyFindings({ watcher, storage, cookies }) {
 
   // Tracking IDs stored in this browser.
   const ids = [];
-  for (const k of storage?.localStorage ?? []) if (TRACKING_ID_KEYS.test(k.key)) ids.push(`localStorage ${k.key}`);
+  // Read directly (it's instant), so a slow storage walk can't hide these.
+  let keys = []; try { keys = Object.keys(localStorage); } catch { keys = (storage?.localStorage ?? []).map(k => k.key); }
+  for (const k of keys) if (TRACKING_ID_KEYS.test(k)) ids.push(`localStorage ${k}`);
   for (const c of cookies) if (TRACKING_ID_KEYS.test(c.name)) ids.push(`cookie ${c.name}`);
   if (ids.length) findings.push({ sev: 'low', title: `${ids.length} tracking ID${ids.length > 1 ? 's' : ''} stored in your browser`, evidence: ids,
     means: 'Long-lived IDs that let analytics and ad services recognize you on your next visit.', todo: 'Clearing this site\'s data resets them.' });
@@ -79,6 +81,61 @@ export function staticFingerprinting(texts) {
     if (hits.length >= 3) findings.push({ sev: 'medium', title: `Fingerprinting code in ${where}`, evidence: [where, ...hits],
       means: 'This script contains the code to read several hard-to-change details of your device: what a fingerprint is built from. Bot-detection and fraud scripts look the same; on a login or checkout page that may be its purpose.',
       todo: 'Watch the page to see whether it actually runs. Browsers with fingerprinting protection (Firefox strict, Brave, Safari) blunt it.' });
+  }
+  return findings;
+}
+
+// What Live watch saw: your typing leaving the page, third-party scripts reading personal fields or listening to
+// keystrokes, and which servers received data. Only covers what happened while watching.
+const hostOfScript = s => { try { return new URL(s).hostname; } catch { return ''; } };
+export function watchFindings(watcher) {
+  if (!watcher.startedAt) return [];
+  const findings = [];
+  const hosts = watcher.byHost();
+  for (const h of hosts.filter(h => h.typed.size)) {
+    const third = isThirdPartyHost(h.host), sensitive = [...h.typed.values()].some(Boolean);
+    const cat = hostCategory(h.host);
+    findings.push(third
+      ? { sev: sensitive ? 'high' : 'medium', title: `What you typed was sent to ${h.host}`, evidence: [`${h.host}${cat ? ` (${cat})` : ''}`, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+          means: sensitive ? 'Text from a personal field (password, email, phone or card) left the page for another company\'s server.' : 'Text you typed went to another company\'s server, often search terms sent to analytics or ad partners.',
+          todo: sensitive ? 'Don\'t enter real details on this page unless you trust that company with them.' : 'Avoid typing anything private into this page.' }
+      : { sev: 'info', title: 'What you typed was sent to the site itself', evidence: [h.host, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+          means: 'Normal for search boxes, autocomplete and forms.', todo: 'Nothing.' });
+  }
+  const readers = new Map();
+  for (const r of watcher.fieldReads) {
+    const host = hostOfScript(r.script);
+    if (!isThirdPartyHost(host)) continue;
+    const x = readers.get(host) ?? { scripts: new Set(), fields: new Set() };
+    x.scripts.add(r.script.split('?')[0]); x.fields.add(r.field); readers.set(host, x);
+  }
+  for (const [host, x] of readers) {
+    const secret = [...x.fields].some(f => /password|card|cc-|cvc|cvv|ssn|iban/i.test(f));
+    findings.push({ sev: secret ? 'high' : 'medium', title: `A script from ${host} read your ${secret ? 'password or card field' : 'personal fields'}`, evidence: [...x.scripts, ...x.fields],
+      means: 'A third-party script on this page read what you entered. Session-replay and analytics tools do this; so does a card skimmer (Magecart).',
+      todo: secret ? 'Don\'t enter real passwords or card numbers here unless you trust this company.' : 'Expect what you type here to be shared with that company.' });
+  }
+  const keyHosts = new Map();
+  for (const k of watcher.keyListeners) {
+    const host = hostOfScript(k.script);
+    if (isThirdPartyHost(host)) (keyHosts.get(host) ?? keyHosts.set(host, new Set()).get(host)).add(`${k.type} on ${k.target}`);
+  }
+  for (const [host, what] of keyHosts) {
+    // Listening on a form field is about what you type there; listening on the whole page is usually about whether
+    // a human is present (ad verification, bot detection).
+    const onField = [...what].some(w => /<(input|textarea)/.test(w));
+    findings.push({ sev: onField ? 'medium' : 'low', title: `A script from ${host} listens to your keystrokes${onField ? ' in form fields' : ''}`, evidence: [...what].slice(0, 6),
+      means: (onField ? 'It attached to the fields you type in. Session-replay tools and card skimmers do this to capture what you enter.' :
+        'It listens on the whole page. Ad-verification and bot-detection scripts do this to check a person is there, usually noting that keys were pressed, not which.') +
+        ' "What you typed was sent to…" (above, if present) shows whether your text actually left the page.',
+      todo: onField ? 'Check what that company is before typing anything private here.' : 'Nothing, unless your typing also shows up in its requests.' });
+  }
+  const out = hosts.filter(h => isThirdPartyHost(h.host));
+  if (out.length) {
+    const kb = out.reduce((n, h) => n + h.bytes, 0) / 1024;
+    findings.push({ sev: 'info', title: `${out.length} other server${out.length > 1 ? 's' : ''} received data while watching (${kb.toFixed(kb < 10 ? 1 : 0)} KB)`,
+      evidence: out.slice(0, 8).map(h => `${h.host}: ${h.requests} request${h.requests > 1 ? 's' : ''}, ${(h.bytes / 1024).toFixed(1)} KB${hostCategory(h.host) ? ` (${hostCategory(h.host)})` : ''}`),
+      means: 'Every server outside this site that the page sent something to since you started watching.', todo: 'The Live watch tab lists them all.' });
   }
   return findings;
 }

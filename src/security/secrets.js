@@ -19,6 +19,7 @@ export function secretFindings(sources, cookies) {
     if (!text) continue;
     // An opaque token stored under a token-like name (access_token, auth, session...): readable by any script.
     if (kind === 'storage' && key && SESSION_COOKIE.test(key) && !NOT_SESSION_COOKIE.test(key) && /^[\w\-.~+/=]{20,}$/.test(text) && !new RegExp(JWT.source).test(text)) {
+      if (VISITOR_SESSION.test(key)) { findings.push(visitorSession(where, text)); continue; }
       findings.push({ sev: 'medium', title: `Token-like value in ${where.split('[')[0]}`, evidence: [mask(text), where],
         means: 'Something stored under a login/session name. Storage like this can be read by any script on the page, so an XSS bug can steal it.',
         todo: 'If it\'s your app: keep session tokens in HttpOnly, Secure, SameSite cookies.' });
@@ -63,10 +64,17 @@ export function secretFindings(sources, cookies) {
   // Session cookies readable by JS (HttpOnly cookies never appear in document.cookie, so these are the exposed ones).
   for (const c of cookies) {
     if (!SESSION_COOKIE.test(c.name) || NOT_SESSION_COOKIE.test(c.name) || new RegExp(JWT.source).test(c.value)) continue; // JWTs reported above
+    if (c.value.length < 16 || /^(\{|%7B)/i.test(c.value)) continue; // a flag, counter or JSON blob, not a session token
+    if (VISITOR_SESSION.test(c.name)) { findings.push(visitorSession(`cookie ${c.name}`, c.value)); continue; }
     findings.push({ sev: 'medium', title: `Session cookie "${c.name}" is readable by scripts`, evidence: [mask(c.value), 'document.cookie'],
       means: 'It isn\'t marked HttpOnly, so any script on the page (including an XSS attack) can read and steal it.', todo: 'If it\'s your site: set HttpOnly (and Secure, SameSite) on session cookies.' });
   }
   return findings;
+}
+
+function visitorSession(where, value) {
+  return { sev: 'low', title: `Visitor session ID readable by scripts (${where.replace(/^cookie /, '').slice(0, 40)})`, evidence: [mask(value), where],
+    means: 'Named like a session, but it belongs to an analytics, ad or bot-check service: it identifies this visit, not your login.', todo: 'Nothing. Clearing this site\'s data resets it.' };
 }
 
 // Everything secrets can hide in, gathered from the page. scriptTexts = [[where, text]] already fetched for hints.

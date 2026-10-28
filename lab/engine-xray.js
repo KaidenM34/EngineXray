@@ -261,7 +261,11 @@ const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 function timedFetch(url, opts = {}, ms = 8000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
-  return fetch(url, { ...opts, signal: ctrl.signal }).then(res => {
+  // .busy marks EngineX-ray's own requests while the fetch call starts, so Live watch doesn't count them.
+  timedFetch.busy = (timedFetch.busy ?? 0) + 1;
+  let started;
+  try { started = fetch(url, { ...opts, signal: ctrl.signal }); } finally { timedFetch.busy--; }
+  return started.then(res => {
     const read = kind => () => res[kind]().finally(() => clearTimeout(timer));
     return { ok: res.ok, status: res.status, headers: res.headers, text: read('text'), arrayBuffer: read('arrayBuffer') };
   }, e => { clearTimeout(timer); throw e; });
@@ -509,6 +513,9 @@ const SECRET_PATTERNS = [
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
 const SESSION_COOKIE = /sess|\bsid\b|auth|token|jwt|login|remember|access|refresh/i;
 const NOT_SESSION_COOKIE = /^(_ga|_gid|_gcl|_fbp|_fbc|__cf|cf_|_hj|ajs_|amplitude|mp_|_clck|_clsk|csrf|xsrf|_csrf|cookie_?consent|OptanonConsent)/i;
+// Session-named cookies and keys that belong to analytics, ad, feedback and bot-check vendors (seen in the 20-site
+// survey): they identify a visit, not a login. Reported as low, not as an exposed login session.
+const VISITOR_SESSION = /^(aws-waf-token|_pin_unauth)$|^(ab\.storage|kampyle|__attentive|_parsely|optimizely|blaize|bcsession|logglytracking|gc_session|mgnisession|__milesession|s_sess$|as_session_id|cet-page_session|bf-xdomain|foxkit|ebay-rum|session_landing|_sdsat|ffsession|app_session_id|poki_session)|rum-session|session-data$/i;
 const TRACKING_ID_KEYS = /^(_ga|_gid|_fbp|_fbc|ajs_anonymous_id|ajs_user_id|amplitude_id|_hjSessionUser|_clck|mp_.*_mixpanel|__hstc|hubspotutk|_uetvid|_pin_unauth|_tt_enable_cookie|_ttp)/i;
 
 function hostCategory(hostname) {
@@ -520,6 +527,10 @@ function hostCategory(hostname) {
 function isMinerHost(hostname) {
   return MINER_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d));
 }
+
+// Another site than this page's (compared by the last two name parts, so cdn.example.com counts as example.com).
+const siteOf = host => host.split('.').slice(-2).join('.');
+const isThirdPartyHost = host => !!host && host !== location.hostname && siteOf(host) !== siteOf(location.hostname);
 
 // ---- security/hooks.js ----
 // "Watch this page": wraps a few browser APIs so the Security tab can see what scripts do from now on. Every wrapper
@@ -536,19 +547,44 @@ function callerScript() {
   return '(inline script)';
 }
 
+// Form fields whose contents are personal enough to flag when a third party reads or receives them.
+const SENSITIVE_FIELD = /pass|card|cc-|cvc|cvv|ssn|social|iban|account|routing/i;
+function fieldInfo(el) {
+  const type = (el.type || el.tagName || '').toLowerCase();
+  const name = el.name || el.id || el.getAttribute?.('autocomplete') || '';
+  const sensitive = type === 'password' || type === 'email' || type === 'tel' || SENSITIVE_FIELD.test(`${name} ${el.getAttribute?.('autocomplete') ?? ''}`);
+  return { label: `${type} field${name ? ` "${String(name).slice(0, 30)}"` : ''}`, sensitive };
+}
+function bodyText(body) {
+  try {
+    if (body == null) return '';
+    if (typeof body === 'string') return body;
+    if (body instanceof URLSearchParams) return body.toString();
+    if (body instanceof FormData) return [...body].map(([k, v]) => `${k}=${typeof v === 'string' ? v : ''}`).join('&');
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return new TextDecoder().decode(body.slice ? body.slice(0, 200000) : body);
+  } catch {}
+  return ''; // Blobs and streams are counted but not read
+}
+
 function createWatcher() {
   const restore = [];
-  const events = [];                // { tech, script, detail, t }
+  const events = [];                // fingerprinting calls: { tech, script, detail, t }
   const sockets = [];               // { url, script, sent: [], received: [] }
   const workers = [];               // { url, script }
+  const requests = [];              // data leaving the page: { host, url, method, bytes, kind, script, typed }
+  const fieldReads = [];            // scripts reading personal form fields: { script, field, sensitive }
+  const keyListeners = [];          // scripts listening to keystrokes: { script, type, target }
+  const typed = new Map();          // what's in each field you typed in while watching: value -> { label, sensitive }
+  const typedBy = new WeakMap();    // field -> its value in `typed`, so only the current value is checked
   const listeners = new Set();
-  let on = false, quiet = 0;
+  let on = false, quiet = 0, startedAt = 0;
+  const changed = () => listeners.forEach(fn => fn());
 
   const record = (tech, detail = '') => {
     if (quiet) return; // EngineX-ray's own analysis, not the page
     events.push({ tech, script: callerScript(), detail: String(detail).slice(0, 200), t: Math.round(performance.now()) });
     if (events.length > 5000) events.splice(0, 1000);
-    listeners.forEach(fn => fn());
+    changed();
   };
   const wrapMethod = (proto, name, tech, filter) => {
     if (!proto || typeof proto[name] !== 'function') return;
@@ -576,8 +612,34 @@ function createWatcher() {
     restore.push(() => { owner[name] = Original; });
   };
 
+  // Which of the fields you typed in does this outgoing text carry? Checked as-is, URL-encoded and lowercased.
+  function typedIn(text) {
+    if (!typed.size || !text) return [];
+    const hay = text.length > 200000 ? text.slice(0, 200000) : text;
+    let lower;
+    const hits = [];
+    for (const [value, field] of typed) {
+      if (hay.includes(value) || hay.includes(encodeURIComponent(value)) || (lower ??= hay.toLowerCase()).includes(value.toLowerCase())) hits.push(field);
+    }
+    return hits;
+  }
+  // Never throws: it runs inside the page's own fetch/XHR calls.
+  function noteRequest(url, method, body, kind, script) {
+    if (quiet || timedFetch.busy) return; // EngineX-ray's own requests
+    try {
+      const u = new URL(url, location.href);
+      if (!/^(https?|wss?):$/.test(u.protocol)) return;
+      const text = bodyText(body);
+      let query = u.search; try { query = decodeURIComponent(query.replace(/\+/g, ' ')); } catch {}
+      const fields = [...new Set([...typedIn(query), ...typedIn(text)])];
+      requests.push({ host: u.hostname, url: (u.origin + u.pathname).slice(0, 160), method, bytes: (body?.size ?? body?.byteLength ?? text.length) + u.search.length, kind, script: script ?? callerScript(), typed: fields });
+      if (requests.length > 3000) requests.splice(0, 500);
+      changed();
+    } catch {}
+  }
+
   function start() {
-    if (on) return; on = true;
+    if (on) return; on = true; startedAt = Date.now();
     // fingerprinting
     wrapMethod(HTMLCanvasElement.prototype, 'toDataURL', 'canvas readback');
     wrapMethod(HTMLCanvasElement.prototype, 'toBlob', 'canvas readback');
@@ -599,12 +661,77 @@ function createWatcher() {
       const entry = { url: String(args[0]), script: callerScript(), sent: [], received: [] };
       sockets.push(entry);
       const send = ws.send;
-      ws.send = function (data) { if (entry.sent.length < 8) entry.sent.push(String(data).slice(0, 300)); listeners.forEach(fn => fn()); return send.call(this, data); };
-      ws.addEventListener('message', e => { if (entry.received.length < 8) { entry.received.push(String(e.data).slice(0, 300)); listeners.forEach(fn => fn()); } });
-      listeners.forEach(fn => fn());
+      ws.send = function (data) { if (entry.sent.length < 8) entry.sent.push(String(data).slice(0, 300)); noteRequest(entry.url, 'WS', data, 'websocket', entry.script); return send.call(this, data); };
+      ws.addEventListener('message', e => { if (entry.received.length < 8) { entry.received.push(String(e.data).slice(0, 300)); changed(); } });
+      changed();
     });
-    wrapConstructor(window, 'Worker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); listeners.forEach(fn => fn()); });
-    wrapConstructor(window, 'SharedWorker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); listeners.forEach(fn => fn()); });
+    wrapConstructor(window, 'Worker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); changed(); });
+    wrapConstructor(window, 'SharedWorker', (w, args) => { workers.push({ url: String(args[0]), script: callerScript() }); changed(); });
+
+    // Data leaving the page: fetch, XHR, beacons (and WebSocket messages above). Images, pixels and scripts come
+    // from the resource timeline instead (no body, and no way to tell which script asked for them).
+    const fetch0 = window.fetch;
+    window.fetch = function (input, init) {
+      try { noteRequest(input instanceof Request ? input.url : String(input), String(init?.method ?? input?.method ?? 'GET').toUpperCase(), init?.body, 'fetch'); } catch {}
+      return fetch0.apply(this, arguments);
+    };
+    restore.push(() => { window.fetch = fetch0; });
+    const xhrTarget = new WeakMap(), open0 = XMLHttpRequest.prototype.open, send0 = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) { xhrTarget.set(this, [String(method).toUpperCase(), String(url)]); return open0.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function (body) { const t = xhrTarget.get(this); if (t) noteRequest(t[1], t[0], body, 'xhr'); return send0.apply(this, arguments); };
+    restore.push(() => { XMLHttpRequest.prototype.open = open0; XMLHttpRequest.prototype.send = send0; });
+    if (navigator.sendBeacon) {
+      const beacon0 = Navigator.prototype.sendBeacon;
+      Navigator.prototype.sendBeacon = function (url, data) { noteRequest(String(url), 'POST', data, 'beacon'); return beacon0.apply(this, arguments); };
+      restore.push(() => { Navigator.prototype.sendBeacon = beacon0; });
+    }
+    try {
+      const po = new PerformanceObserver(list => {
+        for (const e of list.getEntries()) if (!['fetch', 'xmlhttprequest', 'beacon'].includes(e.initiatorType)) noteRequest(e.name, 'GET', null, e.initiatorType, '(page)');
+      });
+      po.observe({ type: 'resource' });
+      restore.push(() => po.disconnect());
+    } catch {}
+
+    // What you type, so outgoing requests can be checked for it. Our listener reads the raw value getter, so it
+    // never shows up as a "field read" itself.
+    const value0 = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    const areaValue0 = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+    const onInput = e => {
+      const el = e.target;
+      const d = el instanceof HTMLInputElement ? value0 : el instanceof HTMLTextAreaElement ? areaValue0 : null;
+      if (!d) return;
+      // Only the field's current value: requests are checked when they're sent, so a search box that sends every
+      // prefix is still caught, and short leftovers like "test" can't match unrelated traffic later.
+      const v = d.get.call(el), old = typedBy.get(el);
+      if (old != null) typed.delete(old);
+      if (v && v.length >= 5 && v.length < 200) { typed.set(v, fieldInfo(el)); typedBy.set(el, v); } else typedBy.delete(el);
+    };
+    const addEvent0 = EventTarget.prototype.addEventListener;
+    addEvent0.call(document, 'input', onInput, true);
+    restore.push(() => document.removeEventListener('input', onInput, true));
+
+    // Scripts reading personal form fields (passwords, email, phone, card numbers).
+    const reads = new WeakMap();
+    Object.defineProperty(HTMLInputElement.prototype, 'value', { ...value0, get() {
+      const v = value0.get.call(this);
+      if (v && !quiet) try {
+        const n = reads.get(this) ?? 0;
+        if (n < 20) { const f = fieldInfo(this); if (f.sensitive) { reads.set(this, n + 1); fieldReads.push({ script: callerScript(), field: f.label, sensitive: f.sensitive }); changed(); } }
+      } catch {}
+      return v;
+    } });
+    restore.push(() => Object.defineProperty(HTMLInputElement.prototype, 'value', value0));
+
+    // Scripts that start listening to keystrokes. (Listeners added before watching began aren't visible.)
+    EventTarget.prototype.addEventListener = function (type) {
+      if (!quiet && /^(key(down|up|press)|input|paste)$/.test(type)) try {
+        const target = this === document ? 'document' : this === window ? 'window' : this instanceof Element ? `<${this.tagName.toLowerCase()}${this.type ? ` type=${this.type}` : ''}>` : 'object';
+        keyListeners.push({ script: callerScript(), type, target }); changed();
+      } catch {}
+      return addEvent0.apply(this, arguments);
+    };
+    restore.push(() => { EventTarget.prototype.addEventListener = addEvent0; });
   }
   function stop() {
     if (!on) return; on = false;
@@ -621,11 +748,23 @@ function createWatcher() {
     }
     return out;
   }
+  // Per destination: how many requests, how much was sent, and which of your typed fields showed up in them.
+  function byHost() {
+    const out = new Map();
+    for (const r of requests) {
+      const x = out.get(r.host) ?? { host: r.host, requests: 0, bytes: 0, typed: new Map(), kinds: new Set() };
+      x.requests++; x.bytes += r.bytes || 0; x.kinds.add(r.kind);
+      for (const f of r.typed) x.typed.set(f.label, f.sensitive);
+      out.set(r.host, x);
+    }
+    return [...out.values()].sort((a, b) => b.typed.size - a.typed.size || b.bytes - a.bytes || b.requests - a.requests);
+  }
 
   // Run fn without recording: used for EngineX-ray's own work (its checks read navigator too).
   const quietly = fn => { quiet++; try { return fn(); } finally { quiet--; } };
 
-  return { start, stop, quietly, get on() { return on; }, events, sockets, workers, byScript, onChange: fn => listeners.add(fn) };
+  return { start, stop, quietly, get on() { return on; }, get startedAt() { return startedAt; }, get typedCount() { return typed.size; },
+    events, sockets, workers, requests, fieldReads, keyListeners, byScript, byHost, onChange: fn => listeners.add(fn) };
 }
 
 // ---- security/miner.js ----
@@ -777,7 +916,9 @@ function privacyFindings({ watcher, storage, cookies }) {
 
   // Tracking IDs stored in this browser.
   const ids = [];
-  for (const k of storage?.localStorage ?? []) if (TRACKING_ID_KEYS.test(k.key)) ids.push(`localStorage ${k.key}`);
+  // Read directly (it's instant), so a slow storage walk can't hide these.
+  let keys = []; try { keys = Object.keys(localStorage); } catch { keys = (storage?.localStorage ?? []).map(k => k.key); }
+  for (const k of keys) if (TRACKING_ID_KEYS.test(k)) ids.push(`localStorage ${k}`);
   for (const c of cookies) if (TRACKING_ID_KEYS.test(c.name)) ids.push(`cookie ${c.name}`);
   if (ids.length) findings.push({ sev: 'low', title: `${ids.length} tracking ID${ids.length > 1 ? 's' : ''} stored in your browser`, evidence: ids,
     means: 'Long-lived IDs that let analytics and ad services recognize you on your next visit.', todo: 'Clearing this site\'s data resets them.' });
@@ -810,6 +951,61 @@ function staticFingerprinting(texts) {
   return findings;
 }
 
+// What Live watch saw: your typing leaving the page, third-party scripts reading personal fields or listening to
+// keystrokes, and which servers received data. Only covers what happened while watching.
+const hostOfScript = s => { try { return new URL(s).hostname; } catch { return ''; } };
+function watchFindings(watcher) {
+  if (!watcher.startedAt) return [];
+  const findings = [];
+  const hosts = watcher.byHost();
+  for (const h of hosts.filter(h => h.typed.size)) {
+    const third = isThirdPartyHost(h.host), sensitive = [...h.typed.values()].some(Boolean);
+    const cat = hostCategory(h.host);
+    findings.push(third
+      ? { sev: sensitive ? 'high' : 'medium', title: `What you typed was sent to ${h.host}`, evidence: [`${h.host}${cat ? ` (${cat})` : ''}`, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+          means: sensitive ? 'Text from a personal field (password, email, phone or card) left the page for another company\'s server.' : 'Text you typed went to another company\'s server, often search terms sent to analytics or ad partners.',
+          todo: sensitive ? 'Don\'t enter real details on this page unless you trust that company with them.' : 'Avoid typing anything private into this page.' }
+      : { sev: 'info', title: 'What you typed was sent to the site itself', evidence: [h.host, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+          means: 'Normal for search boxes, autocomplete and forms.', todo: 'Nothing.' });
+  }
+  const readers = new Map();
+  for (const r of watcher.fieldReads) {
+    const host = hostOfScript(r.script);
+    if (!isThirdPartyHost(host)) continue;
+    const x = readers.get(host) ?? { scripts: new Set(), fields: new Set() };
+    x.scripts.add(r.script.split('?')[0]); x.fields.add(r.field); readers.set(host, x);
+  }
+  for (const [host, x] of readers) {
+    const secret = [...x.fields].some(f => /password|card|cc-|cvc|cvv|ssn|iban/i.test(f));
+    findings.push({ sev: secret ? 'high' : 'medium', title: `A script from ${host} read your ${secret ? 'password or card field' : 'personal fields'}`, evidence: [...x.scripts, ...x.fields],
+      means: 'A third-party script on this page read what you entered. Session-replay and analytics tools do this; so does a card skimmer (Magecart).',
+      todo: secret ? 'Don\'t enter real passwords or card numbers here unless you trust this company.' : 'Expect what you type here to be shared with that company.' });
+  }
+  const keyHosts = new Map();
+  for (const k of watcher.keyListeners) {
+    const host = hostOfScript(k.script);
+    if (isThirdPartyHost(host)) (keyHosts.get(host) ?? keyHosts.set(host, new Set()).get(host)).add(`${k.type} on ${k.target}`);
+  }
+  for (const [host, what] of keyHosts) {
+    // Listening on a form field is about what you type there; listening on the whole page is usually about whether
+    // a human is present (ad verification, bot detection).
+    const onField = [...what].some(w => /<(input|textarea)/.test(w));
+    findings.push({ sev: onField ? 'medium' : 'low', title: `A script from ${host} listens to your keystrokes${onField ? ' in form fields' : ''}`, evidence: [...what].slice(0, 6),
+      means: (onField ? 'It attached to the fields you type in. Session-replay tools and card skimmers do this to capture what you enter.' :
+        'It listens on the whole page. Ad-verification and bot-detection scripts do this to check a person is there, usually noting that keys were pressed, not which.') +
+        ' "What you typed was sent to…" (above, if present) shows whether your text actually left the page.',
+      todo: onField ? 'Check what that company is before typing anything private here.' : 'Nothing, unless your typing also shows up in its requests.' });
+  }
+  const out = hosts.filter(h => isThirdPartyHost(h.host));
+  if (out.length) {
+    const kb = out.reduce((n, h) => n + h.bytes, 0) / 1024;
+    findings.push({ sev: 'info', title: `${out.length} other server${out.length > 1 ? 's' : ''} received data while watching (${kb.toFixed(kb < 10 ? 1 : 0)} KB)`,
+      evidence: out.slice(0, 8).map(h => `${h.host}: ${h.requests} request${h.requests > 1 ? 's' : ''}, ${(h.bytes / 1024).toFixed(1)} KB${hostCategory(h.host) ? ` (${hostCategory(h.host)})` : ''}`),
+      means: 'Every server outside this site that the page sent something to since you started watching.', todo: 'The Live watch tab lists them all.' });
+  }
+  return findings;
+}
+
 // ---- security/secrets.js ----
 // Tokens and secrets that page scripts can read. Values are always masked (first 4 + last 2 characters): the point is
 // to show that a secret is exposed and where, never to copy it.
@@ -832,6 +1028,7 @@ function secretFindings(sources, cookies) {
     if (!text) continue;
     // An opaque token stored under a token-like name (access_token, auth, session...): readable by any script.
     if (kind === 'storage' && key && SESSION_COOKIE.test(key) && !NOT_SESSION_COOKIE.test(key) && /^[\w\-.~+/=]{20,}$/.test(text) && !new RegExp(JWT.source).test(text)) {
+      if (VISITOR_SESSION.test(key)) { findings.push(visitorSession(where, text)); continue; }
       findings.push({ sev: 'medium', title: `Token-like value in ${where.split('[')[0]}`, evidence: [mask(text), where],
         means: 'Something stored under a login/session name. Storage like this can be read by any script on the page, so an XSS bug can steal it.',
         todo: 'If it\'s your app: keep session tokens in HttpOnly, Secure, SameSite cookies.' });
@@ -876,10 +1073,17 @@ function secretFindings(sources, cookies) {
   // Session cookies readable by JS (HttpOnly cookies never appear in document.cookie, so these are the exposed ones).
   for (const c of cookies) {
     if (!SESSION_COOKIE.test(c.name) || NOT_SESSION_COOKIE.test(c.name) || new RegExp(JWT.source).test(c.value)) continue; // JWTs reported above
+    if (c.value.length < 16 || /^(\{|%7B)/i.test(c.value)) continue; // a flag, counter or JSON blob, not a session token
+    if (VISITOR_SESSION.test(c.name)) { findings.push(visitorSession(`cookie ${c.name}`, c.value)); continue; }
     findings.push({ sev: 'medium', title: `Session cookie "${c.name}" is readable by scripts`, evidence: [mask(c.value), 'document.cookie'],
       means: 'It isn\'t marked HttpOnly, so any script on the page (including an XSS attack) can read and steal it.', todo: 'If it\'s your site: set HttpOnly (and Secure, SameSite) on session cookies.' });
   }
   return findings;
+}
+
+function visitorSession(where, value) {
+  return { sev: 'low', title: `Visitor session ID readable by scripts (${where.replace(/^cookie /, '').slice(0, 40)})`, evidence: [mask(value), where],
+    means: 'Named like a session, but it belongs to an analytics, ad or bot-check service: it identifies this visit, not your login.', todo: 'Nothing. Clearing this site\'s data resets it.' };
 }
 
 // Everything secrets can hide in, gathered from the page. scriptTexts = [[where, text]] already fetched for hints.
@@ -902,8 +1106,279 @@ function secretSources({ cookies, scriptTexts, files }) {
   return sources;
 }
 
+// ---- security/web.js ----
+// Site security: how well the site protects you, from what the page already exposes. The response headers come from
+// one re-read of this page (usually straight from the browser's cache); everything else is the live page.
+
+const LOOPBACK = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$|\.localhost$|\.test$/;
+
+async function pageHeaders() {
+  try {
+    const res = await timedFetch(location.href, { credentials: 'include', cache: 'force-cache' }, 8000);
+    const headers = new Map();
+    res.headers.forEach((v, k) => headers.set(k.toLowerCase(), v));
+    res.text().catch(() => {}); // only the headers are needed
+    return { status: res.status, headers };
+  } catch { return null; }
+}
+
+// The policy for scripts: script-src if it's set, else default-src.
+function scriptPolicy(csp) {
+  const directives = new Map(csp.split(';').map(d => d.trim().split(/\s+/)).filter(d => d[0]).map(([k, ...v]) => [k.toLowerCase(), v]));
+  return { directives, script: directives.get('script-src') ?? directives.get('default-src') };
+}
+
+function siteSecurityFindings({ headers }) {
+  const findings = [];
+  const https = location.protocol === 'https:', local = LOOPBACK.test(location.hostname);
+  if (!https && !local) findings.push({ sev: 'high', title: 'This page isn\'t encrypted (plain HTTP)', evidence: [location.origin],
+    means: 'Anyone on the same network (café Wi-Fi, a hotel, your ISP) can read and change this page and what you send to it.', todo: 'Don\'t log in or type anything private here.' });
+
+  const h = headers?.headers;
+  if (!h) findings.push({ sev: 'info', title: 'Couldn\'t read the page\'s security headers', evidence: [location.href.split('?')[0]],
+    means: 'Re-reading the page failed or timed out, so the header checks were skipped.', todo: 'Rescan, or open the page\'s Network entry in DevTools.' });
+  if (h) {
+    const metaCsp = [...document.querySelectorAll('meta[http-equiv="Content-Security-Policy" i]')].map(m => m.content).join('; ');
+    const csp = [h.get('content-security-policy'), metaCsp].filter(Boolean).join('; ');
+    if (https && !local) {
+      const hsts = h.get('strict-transport-security');
+      const maxAge = +(/max-age=(\d+)/i.exec(hsts ?? '')?.[1] ?? 0);
+      if (!hsts) findings.push({ sev: 'low', title: 'No HSTS: the browser isn\'t told to always use HTTPS', evidence: ['Strict-Transport-Security header missing'],
+        means: 'Without it, a first visit typed as plain "site.com" can be intercepted before the redirect to HTTPS (an SSL-stripping attack).', todo: 'If it\'s your site: send Strict-Transport-Security: max-age=31536000; includeSubDomains.' });
+      else if (maxAge < 15552000) findings.push({ sev: 'info', title: 'HSTS is set but short', evidence: [hsts],
+        means: 'The browser forgets the "HTTPS only" rule after less than six months.', todo: 'A max-age of a year (31536000) is the usual choice.' });
+    }
+    if (!csp) findings.push({ sev: 'low', title: 'No Content Security Policy', evidence: ['Content-Security-Policy header missing'],
+      means: 'A CSP limits which scripts may run. Without one, any injected script (an XSS bug, a bad ad) runs with full access to the page.', todo: 'If it\'s your site: add a CSP, even a report-only one to start.' });
+    else {
+      const { script } = scriptPolicy(csp);
+      const strong = script?.some(s => /^'(nonce-|sha256-|sha384-|sha512-|strict-dynamic)/.test(s));
+      if (script?.includes("'unsafe-inline'") && !strong) findings.push({ sev: 'low', title: 'The CSP allows inline scripts', evidence: [`script-src ${script.join(' ')}`.slice(0, 160)],
+        means: '\'unsafe-inline\' lets injected <script> tags run, which removes most of what a CSP protects against.', todo: 'If it\'s your site: switch to nonces or hashes.' });
+      if (script?.some(s => s === '*' || s === 'https:' || s === 'http:')) findings.push({ sev: 'low', title: 'The CSP lets scripts load from anywhere', evidence: [`script-src ${script.join(' ')}`.slice(0, 160)],
+        means: 'A wildcard source means an attacker can load their script from any server.', todo: 'If it\'s your site: list the script hosts you use.' });
+      if (script?.includes("'unsafe-eval'")) findings.push({ sev: 'info', title: 'The CSP allows eval()', evidence: ["'unsafe-eval' in script-src"],
+        means: 'Code can be built from strings at runtime. Often needed by older frameworks; it makes some XSS bugs easier to exploit.', todo: 'Nothing for visitors.' });
+      if (!script) findings.push({ sev: 'info', title: 'The CSP doesn\'t restrict scripts', evidence: [csp.slice(0, 160)],
+        means: 'The policy is there but has no script-src or default-src, so scripts aren\'t limited.', todo: 'Nothing for visitors.' });
+    }
+    if (!h.get('x-frame-options') && !/frame-ancestors/i.test(csp)) findings.push({ sev: 'low', title: 'Other sites can put this page in a frame (clickjacking)', evidence: ['no X-Frame-Options, no CSP frame-ancestors'],
+      means: 'A malicious site can show this page invisibly under its own buttons and trick you into clicking things here.', todo: 'If it\'s your site: send X-Frame-Options: DENY or CSP frame-ancestors \'self\'.' });
+    if (h.get('x-content-type-options')?.toLowerCase() !== 'nosniff') findings.push({ sev: 'info', title: 'No X-Content-Type-Options: nosniff', evidence: ['header missing'],
+      means: 'Browsers may guess file types, which can turn an uploaded file into a script.', todo: 'If it\'s your site: send X-Content-Type-Options: nosniff.' });
+  }
+
+  // Mixed content: parts of an HTTPS page loaded over plain HTTP.
+  if (https) {
+    const plain = performance.getEntriesByType('resource').filter(e => e.name.startsWith('http:') && !LOOPBACK.test(new URL(e.name).hostname));
+    const active = plain.filter(e => ['script', 'iframe', 'xmlhttprequest', 'fetch', 'link', 'css'].includes(e.initiatorType));
+    if (active.length) findings.push({ sev: 'medium', title: 'Code or data loaded over plain HTTP', evidence: [...new Set(active.map(e => e.name.split('?')[0]))].slice(0, 8),
+      means: 'Part of this secure page came over an unencrypted connection, so someone on the network could swap it for their own code.', todo: 'If it\'s your site: load everything over https://.' });
+    const passive = plain.filter(e => !active.includes(e));
+    if (passive.length) findings.push({ sev: 'low', title: 'Images or media loaded over plain HTTP', evidence: [...new Set(passive.map(e => e.name.split('?')[0]))].slice(0, 8),
+      means: 'Others on the network can see which of these you loaded, and swap the pictures.', todo: 'If it\'s your site: load everything over https://.' });
+  }
+
+  // Password forms.
+  for (const form of document.querySelectorAll('form')) {
+    if (!form.querySelector('input[type=password]')) continue;
+    let action; try { action = new URL(form.getAttribute('action') || location.href, location.href); } catch { continue; }
+    const method = (form.getAttribute('method') || 'get').toLowerCase();
+    const label = `${method.toUpperCase()} ${action.origin}${action.pathname}`;
+    if (action.protocol === 'http:' && !LOOPBACK.test(action.hostname)) findings.push({ sev: 'high', title: 'A password form sends over plain HTTP', evidence: [label],
+      means: 'The password would travel unencrypted, readable by anyone on the network.', todo: 'Don\'t use this form. If it\'s your site: post to an https:// address.' });
+    if (method === 'get' && form.querySelector('input[type=password]')) findings.push({ sev: 'medium', title: 'A password form uses GET (the password goes in the URL)', evidence: [label],
+      means: 'Passwords in URLs end up in browser history, server logs and analytics.', todo: 'If it\'s your site: use method="post". (Some sites submit with JavaScript instead; then this is harmless.)' });
+    if (isThirdPartyHost(action.hostname)) findings.push({ sev: 'info', title: 'A password form submits to another site', evidence: [label],
+      means: 'Normal for single sign-on (Google, Microsoft, a university login). Worth a look if the other site is unfamiliar.', todo: 'Check the address is who you expect.' });
+  }
+
+  // Third-party scripts without Subresource Integrity. Practical for fixed library files on public CDNs.
+  const CDNS = /(^|\.)(cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|code\.jquery\.com|(stackpath|maxcdn|netdna)\.bootstrapcdn\.com|ajax\.googleapis\.com|ajax\.aspnetcdn\.com|cdn\.datatables\.net)$/;
+  const external = [...document.querySelectorAll('script[src]')].filter(s => (!s.type || /javascript|module/i.test(s.type)) && !s.integrity)
+    .map(s => { try { return new URL(s.src, location.href); } catch { return null; } }).filter(u => u && isThirdPartyHost(u.hostname));
+  const fromCdn = external.filter(u => CDNS.test(u.hostname));
+  if (fromCdn.length) findings.push({ sev: 'low', title: `${fromCdn.length} library script${fromCdn.length > 1 ? 's' : ''} from a public CDN without an integrity check`, evidence: fromCdn.map(u => u.href.split('?')[0]).slice(0, 8),
+    means: 'If that CDN were hacked, the changed file would run here unnoticed. An integrity="sha384-…" attribute makes the browser refuse a changed file.', todo: 'If it\'s your site: add integrity and crossorigin attributes (cdnjs and jsDelivr show them).' });
+  return findings;
+}
+
+// Known-vulnerable JavaScript libraries, found from the globals they define and from version numbers in script URLs.
+// Each entry: versions below `fixed` (within `major`, when given) have the issue.
+const VULNS = {
+  'jQuery': [
+    { fixed: '1.9.0', id: 'CVE-2012-6708', what: 'XSS through selector strings', sev: 'medium' },
+    { fixed: '3.0.0', id: 'CVE-2015-9251', what: 'XSS from cross-domain AJAX responses', sev: 'medium' },
+    { fixed: '3.4.0', id: 'CVE-2019-11358', what: 'prototype pollution in $.extend', sev: 'medium' },
+    { fixed: '3.5.0', id: 'CVE-2020-11022, CVE-2020-11023', what: 'XSS when inserting HTML', sev: 'medium' }],
+  'jQuery UI': [
+    { fixed: '1.13.0', id: 'CVE-2021-41182, -41183, -41184', what: 'XSS in widget options', sev: 'medium' },
+    { fixed: '1.13.2', id: 'CVE-2022-31160', what: 'XSS in checkboxradio', sev: 'low' }],
+  'AngularJS': [
+    { fixed: '1.8.0', id: 'CVE-2020-7676', what: 'XSS through sanitizer bypass', sev: 'medium' },
+    { fixed: '99.0.0', id: 'end of life', what: 'AngularJS (1.x) stopped getting security fixes in January 2022', sev: 'medium' }],
+  'Bootstrap': [
+    { major: 3, fixed: '3.4.1', id: 'CVE-2019-8331', what: 'XSS in tooltip/popover templates', sev: 'medium' },
+    { major: 4, fixed: '4.3.1', id: 'CVE-2019-8331', what: 'XSS in tooltip/popover templates', sev: 'medium' },
+    { major: 3, fixed: '99.0.0', id: 'end of life', what: 'Bootstrap 3 stopped getting fixes in 2019', sev: 'low' }],
+  'Lodash': [
+    { fixed: '4.17.12', id: 'CVE-2019-10744', what: 'prototype pollution in defaultsDeep', sev: 'medium' },
+    { fixed: '4.17.21', id: 'CVE-2021-23337', what: 'code injection through _.template', sev: 'medium' }],
+  'Underscore': [{ fixed: '1.12.1', id: 'CVE-2021-23358', what: 'code injection through _.template', sev: 'medium' }],
+  'Moment': [{ fixed: '2.29.4', id: 'CVE-2022-31129', what: 'slow regex in date parsing (denial of service)', sev: 'low' }],
+  'Handlebars': [{ fixed: '4.7.7', id: 'CVE-2021-23369, CVE-2021-23383', what: 'code execution when compiling untrusted templates', sev: 'medium' }],
+  'DOMPurify': [
+    { major: 2, fixed: '2.5.4', id: 'CVE-2024-45801', what: 'sanitizer bypass (XSS)', sev: 'medium' },
+    { major: 3, fixed: '3.1.3', id: 'CVE-2024-45801', what: 'sanitizer bypass (XSS)', sev: 'medium' }],
+  'Vue': [{ major: 2, fixed: '99.0.0', id: 'end of life', what: 'Vue 2 stopped getting fixes at the end of 2023', sev: 'low' }],
+};
+const URL_NAMES = [['jquery-ui', 'jQuery UI'], ['jquery', 'jQuery'], ['angular', 'AngularJS'], ['bootstrap', 'Bootstrap'], ['lodash', 'Lodash'], ['underscore', 'Underscore'], ['moment', 'Moment'], ['handlebars', 'Handlebars'], ['dompurify', 'DOMPurify'], ['purify', 'DOMPurify'], ['vue', 'Vue']];
+const cmp = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0); } return 0; };
+
+function detectLibraries() {
+  const found = new Map(); // name -> { version, where }
+  const add = (name, version, where) => { if (/^\d+\.\d+(\.\d+)?/.test(version ?? '') && !found.has(name)) found.set(name, { version: version.match(/^\d+\.\d+(\.\d+)?/)[0], where }); };
+  const get = fn => { try { return fn(); } catch { return undefined; } };
+  add('jQuery', get(() => window.jQuery.fn.jquery), 'window.jQuery');
+  add('jQuery UI', get(() => window.jQuery.ui.version), 'jQuery.ui');
+  add('AngularJS', get(() => window.angular.version.full), 'window.angular');
+  add('Bootstrap', get(() => window.bootstrap?.Tooltip?.VERSION ?? window.jQuery.fn.tooltip.Constructor.VERSION), 'Bootstrap tooltip');
+  if (get(() => typeof window._.cloneDeepWith === 'function')) add('Lodash', get(() => window._.VERSION), 'window._');
+  else add('Underscore', get(() => window._.VERSION), 'window._');
+  add('Moment', get(() => window.moment.version), 'window.moment');
+  add('Handlebars', get(() => window.Handlebars.VERSION), 'window.Handlebars');
+  add('DOMPurify', get(() => window.DOMPurify.version), 'window.DOMPurify');
+  add('Vue', get(() => window.Vue.version), 'window.Vue');
+  for (const e of performance.getEntriesByType('resource')) {
+    if (e.initiatorType !== 'script') continue;
+    const path = e.name.split('?')[0].toLowerCase();
+    for (const [slug, name] of URL_NAMES) {
+      const m = new RegExp(`(?:^|[/@._-])${slug.replace('-', '[-.]?')}(?:\\.min|\\.js|\\.slim)*[/@._-]v?(\\d+\\.\\d+\\.\\d+)`).exec(path);
+      if (m) { add(name, m[1], e.name.split('?')[0].split('/').slice(-3).join('/')); break; }
+    }
+  }
+  return found;
+}
+
+function libraryFindings() {
+  const findings = [], fine = [];
+  for (const [name, { version, where }] of detectLibraries()) {
+    const major = +version.split('.')[0];
+    const hits = (VULNS[name] ?? []).filter(v => (v.major == null || v.major === major) && cmp(version, v.fixed) < 0);
+    if (!hits.length) { fine.push(`${name} ${version}`); continue; }
+    const sev = hits.some(v => v.sev === 'medium') ? 'medium' : 'low';
+    const latest = hits.filter(v => v.fixed !== '99.0.0').map(v => v.fixed).sort(cmp).pop();
+    findings.push({ sev, title: `${name} ${version} has known security bugs`, evidence: [where, ...hits.map(v => `${v.id}: ${v.what}`)],
+      means: 'An outdated library with published vulnerabilities. A bug is only exploitable if the site uses the affected feature, but attackers scan for exactly these versions.',
+      todo: `If it's your site: update ${name}${latest ? ` to ${latest} or later` : ' to a supported version'}.` });
+  }
+  if (fine.length) findings.push({ sev: 'info', title: 'Libraries found, no known issues', evidence: fine,
+    means: 'Versions EngineX-ray recognized and checked against its list of known vulnerabilities.', todo: 'Nothing.' });
+  return findings;
+}
+
+// ---- security/grade.js ----
+// The report card: one A–F grade for how this page treats you, the reasons behind it, and a short plain-English
+// summary. Built from the same findings the Findings tab lists; nothing extra is measured here.
+
+const REPLAY_VENDORS = [['hotjar', 'Hotjar'], ['fullstory', 'FullStory'], ['clarity.ms', 'Microsoft Clarity'], ['contentsquare', 'Contentsquare'],
+  ['quantummetric', 'Quantum Metric'], ['logrocket', 'LogRocket'], ['lr-ingest', 'LogRocket'], ['mouseflow', 'Mouseflow'], ['smartlook', 'Smartlook'],
+  ['luckyorange', 'Lucky Orange'], ['inspectlet', 'Inspectlet'], ['glassbox', 'Glassbox'], ['amplitude', 'Amplitude Session Replay']];
+const FP_VENDORS = [['px-cloud', 'HUMAN (PerimeterX)'], ['perimeterx', 'HUMAN (PerimeterX)'], ['humansecurity', 'HUMAN (PerimeterX)'], ['px-cdn', 'HUMAN (PerimeterX)'],
+  ['fpjs', 'FingerprintJS'], ['fpcdn', 'FingerprintJS'], ['fingerprint', 'FingerprintJS'], ['online-metrix', 'ThreatMetrix'], ['iovation', 'iovation'],
+  ['datadome', 'DataDome'], ['kasada', 'Kasada'], ['arkoselabs', 'Arkose Labs']];
+const vendorNames = (hosts, table) => [...new Set(hosts.map(h => table.find(([k]) => h.includes(k))?.[1] ?? h))];
+const list = names => names.length <= 2 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+
+function gradeReport(security, parties) {
+  const deductions = [];
+  const take = (points, why, area) => { if (points > 0) deductions.push({ points: Math.round(points), why, area }); };
+  const cat = c => parties.filter(p => p.category === c).map(p => p.host);
+  const sec = name => security[name] ?? [];
+  const count = (items, sev) => items.filter(f => f.sev === sev).length;
+
+  // Recording and fingerprinting
+  const replay = vendorNames(cat('session replay'), REPLAY_VENDORS);
+  if (replay.length) take(25, `Records your clicks, scrolling and typing (${list(replay)})`, 'recording');
+  const fpHosts = cat('fingerprinting / bot detection');
+  const fpCode = sec('Privacy').filter(f => /fingerprint/i.test(f.title) && f.sev !== 'info');
+  const fpNames = vendorNames(fpHosts, FP_VENDORS);
+  if (fpHosts.length || fpCode.length) take(10, `Builds a device fingerprint${fpNames.length ? ` (${list(fpNames)})` : ''}`, 'fingerprinting');
+
+  // Trackers
+  const ads = cat('ads').length, social = cat('social pixels').length;
+  take(Math.min(20, Math.ceil(ads / 2)), `${ads} ad-network server${ads === 1 ? '' : 's'} see your visit`, 'trackers');
+  take(Math.min(8, social * 2), `${social} social-media tracker${social === 1 ? '' : 's'} (they know you visited, even without a click)`, 'trackers');
+  if (parties.length > 100) take(8, `${parties.length} outside servers loaded by one page`, 'trackers');
+  else if (parties.length > 50) take(4, `${parties.length} outside servers loaded by one page`, 'trackers');
+
+  // Miner, leaks, site security, live watch
+  const miner = sec('Crypto-miner');
+  if (count(miner, 'high')) take(60, 'Contains a hidden crypto-miner', 'miner');
+  else if (count(miner, 'low') + count(miner, 'medium')) take(5, 'Has mining-related code (unconfirmed)', 'miner');
+  const secrets = sec('Secrets & tokens');
+  take(Math.min(50, count(secrets, 'high') * 25), `${count(secrets, 'high')} exposed key${count(secrets, 'high') === 1 ? '' : 's'} or forgeable token${count(secrets, 'high') === 1 ? '' : 's'}`, 'leaks');
+  take(Math.min(12, count(secrets, 'medium') * 4), `${count(secrets, 'medium')} login token${count(secrets, 'medium') === 1 ? '' : 's'} readable by any script on the page`, 'leaks');
+  const site = sec('Site security');
+  for (const f of site.filter(f => f.sev === 'high')) take(20, f.title, 'site');
+  for (const f of site.filter(f => f.sev === 'medium')) take(8, f.title, 'site');
+  take(Math.min(9, count(site, 'low') * 3), `${count(site, 'low')} missing protection${count(site, 'low') === 1 ? '' : 's'} (${site.filter(f => f.sev === 'low').map(f => shortName(f.title)).join(', ')})`, 'site');
+  const watch = sec('Live watch');
+  for (const f of watch.filter(f => f.sev === 'high')) take(20, f.title, 'watch');
+  for (const f of watch.filter(f => f.sev === 'medium')) take(10, f.title, 'watch');
+
+  const score = Math.max(0, 100 - deductions.reduce((n, d) => n + d.points, 0));
+  const letter = score >= 90 ? 'A' : score >= 80 ? 'B' : score >= 70 ? 'C' : score >= 60 ? 'D' : 'F';
+  deductions.sort((a, b) => b.points - a.points);
+
+  // The summary: the few facts a person would want to know. Problems first, worst first; the all-clear lines last.
+  const summary = [], fine = [];
+  if (count(miner, 'high')) summary.push('Runs a hidden crypto-miner on your computer.');
+  for (const f of watch.filter(f => f.sev === 'high')) summary.push(f.title + '.');
+  if (replay.length) summary.push(`Records your clicks, scrolling and typing (${list(replay)}).`);
+  const highLeaks = secrets.filter(f => f.sev === 'high');
+  if (highLeaks.length) summary.push(`Exposes ${highLeaks.length === 1 ? 'a secret' : `${highLeaks.length} secrets`}: ${[...new Set(highLeaks.map(f => f.title.replace(/ in (the page's code|storage|cookie)$/, '')))].join(', ')}.`);
+  else fine.push('No leaked keys or forgeable login tokens found.');
+  const siteBad = site.filter(f => f.sev === 'high' || f.sev === 'medium');
+  if (siteBad.length) summary.push(`Site security: ${siteBad.slice(0, 2).map(f => lowerFirst(f.title)).join('; ')}.`);
+  else fine.push(count(site, 'low') ? `Site security is mostly fine; missing ${site.filter(f => f.sev === 'low').slice(0, 2).map(f => shortName(f.title)).join(' and ')}.` : 'Site security checks passed.');
+  if (fpNames.length || fpCode.length) summary.push(`Fingerprints your device${fpNames.length ? ` with ${list(fpNames)}` : ''}${fpNames.some(n => /HUMAN|DataDome|Kasada|Arkose|ThreatMetrix|iovation/.test(n)) ? ', usually to block bots' : ''}.`);
+  if (ads + social) summary.push(`Shares your visit with ${[ads && `${ads} ad-network server${ads === 1 ? '' : 's'}`, social && `${social} social tracker${social === 1 ? '' : 's'}`].filter(Boolean).join(' and ')}.`);
+  else fine.push('No ad networks or social trackers loaded (before any cookie banner click).');
+  summary.push(...fine);
+
+  // One tile per area for the report card.
+  const tile = (area, label, bad, warn, text) => ({ area, label, state: bad ? 'bad' : warn ? 'warn' : 'good', text });
+  const lowSite = count(site, 'low'), watched = !!watch.length;
+  const tiles = [
+    tile('recording', 'Session recording', replay.length, false, replay.length ? list(replay) : 'None found'),
+    tile('fingerprinting', 'Fingerprinting', false, fpHosts.length || fpCode.length, fpNames.length ? list(fpNames) : fpCode.length ? 'Fingerprinting code' : 'None found'),
+    tile('trackers', 'Trackers', ads > 20, ads + social > 0, `${ads} ad · ${social} social · ${parties.length} outside server${parties.length === 1 ? '' : 's'}`),
+    tile('site', 'Site security', siteBad.length, lowSite > 0, siteBad.length ? `${siteBad.length} problem${siteBad.length > 1 ? 's' : ''}` : lowSite ? `${lowSite} missing protection${lowSite > 1 ? 's' : ''}` : 'Looks fine'),
+    tile('leaks', 'Leaked secrets', highLeaks.length, count(secrets, 'medium'), highLeaks.length ? `${highLeaks.length} exposed` : count(secrets, 'medium') ? `${count(secrets, 'medium')} readable token${count(secrets, 'medium') > 1 ? 's' : ''}` : 'None found'),
+    tile('miner', 'Crypto-miner', count(miner, 'high'), count(miner, 'low') + count(miner, 'medium'), count(miner, 'high') ? 'Found' : 'None found'),
+    tile('watch', 'Live watch', watch.some(f => f.sev === 'high'), watch.some(f => f.sev === 'medium'), watched ? `${watch.filter(f => f.sev !== 'info').length} issue${watch.filter(f => f.sev !== 'info').length === 1 ? '' : 's'} seen` : 'Not switched on'),
+  ];
+  if (!watched) tiles.at(-1).state = 'off'; // grey until Live watch has been switched on
+  return { score, letter, deductions, summary: summary.slice(0, 5), tiles };
+}
+
+// Lowercase the first letter, unless it starts a name or acronym ("jQuery", "HSTS").
+const lowerFirst = t => /^[A-Z]{2}|^[a-z]/.test(t) ? t : t[0].toLowerCase() + t.slice(1);
+
+// "No HSTS: the browser isn't told…" -> "HSTS", for compact lists.
+function shortName(title) {
+  if (/HSTS/.test(title)) return 'HSTS';
+  if (/Content Security Policy|CSP/.test(title)) return /inline/.test(title) ? 'a strict CSP' : 'a CSP';
+  if (/frame/.test(title)) return 'clickjacking protection';
+  if (/integrity/.test(title)) return 'script integrity checks';
+  if (/known security bugs/.test(title)) return 'library updates';
+  return title.split(/[:(]/)[0].toLowerCase();
+}
+
 // ---- main.js ----
-// EngineX-ray: click the bookmark on a browser game and see what's under the hood.
+// EngineX-ray: click the bookmark on any page and see how it treats you: a privacy and security report card, the
+// evidence behind it, and a live watch of where your data goes. Engine tools for WebAssembly games live under Advanced.
 // Built by make.sh into one script (engine-xray.js) and a bookmarklet; the modules above are pasted in front of this.
 
 (async () => {
@@ -916,7 +1391,7 @@ function secretSources({ cookies, scriptTexts, files }) {
   const pagesMb = p => p == null ? 'no limit' : mb(p * 65536);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, skipped: [], tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
+  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, skipped: [], tab: 'report', adv: 'overview', focus: null, stringQuery: '', stringPreset: null, onlyInteresting: true };
   const recorder = consoleRecorder();
   const watcher = createWatcher();
   state.security = null;
@@ -963,9 +1438,22 @@ function secretSources({ cookies, scriptTexts, files }) {
     .sev { display: inline-block; font-size: 11px; font-weight: 800; letter-spacing: .5px; padding: 1px 7px; border-radius: 4px; margin-right: 6px; background: #2c2f36; color: #c8cbd1; text-transform: uppercase; }
     .sev.high { background: #ff5c5c; color: #160404; } .sev.medium { background: #ffb347; color: #1a0f00; } .sev.low { background: #ffe066; color: #1a1500; }
     .summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; } .watching { color: #5cf2c8; font-weight: 700; }
+    .grade { display: flex; gap: 14px; align-items: center; }
+    .letter { width: 74px; height: 74px; flex: none; border-radius: 16px; display: grid; place-items: center; font-size: 46px; font-weight: 900; color: #0b0c0e; }
+    .letter.A { background: #5cf2c8; } .letter.B { background: #9be36b; } .letter.C { background: #ffe066; } .letter.D { background: #ffb347; } .letter.F { background: #ff5c5c; }
+    .site { font-size: 15px; font-weight: 750; color: #fff; word-break: break-all; } .score { color: #8a8f99; }
+    .said { margin: 10px 0 0; padding: 0; list-style: none; } .said li { padding: 3px 0 3px 16px; position: relative; }
+    .said li::before { content: '•'; position: absolute; left: 3px; color: #5cf2c8; }
+    .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 8px 0; }
+    .tile { background: #15171c; border: 1px solid #23262d; border-left: 4px solid #5cf2c8; border-radius: 8px; padding: 7px 9px; cursor: pointer; text-align: left; color: inherit; font: inherit; }
+    .tile.warn { border-left-color: #ffb347; } .tile.off { border-left-color: #4a4e57; } .tile.bad { border-left-color: #ff5c5c; } .tile:hover { background: #1b1e24; }
+    .tile b { display: block; font-size: 12px; color: #c8cbd1; } .tile span { font-size: 12px; color: #8a8f99; }
+    .ded { display: grid; grid-template-columns: 38px 1fr; gap: 2px 8px; } .ded b { color: #ff7a7a; text-align: right; }
+    details summary { cursor: pointer; color: #8a8f99; font-size: 12px; margin-top: 4px; }
+    .sub { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
   </style>
   <div class="panel">
-    <header><b>EngineX-ray</b><span class="status">scanning…</span><button class="close" title="Close">✕</button></header>
+    <header><b>EngineX-ray</b><span class="status">checking this page…</span><button class="close" title="Close">✕</button></header>
     <nav></nav>
     <main></main>
   </div>`;
@@ -983,18 +1471,28 @@ function secretSources({ cookies, scriptTexts, files }) {
   });
   $('.close').onclick = () => $('.panel').classList.add('hidden');
 
-  const TABS = { overview: 'Overview', security: 'Security', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console', report: 'Report' };
+  const wire = {}; // per-tab event wiring, run after each render
+  const TABS = { report: 'Report card', findings: 'Findings', watch: 'Live watch', advanced: 'Advanced', export: 'Export' };
+  const ADVANCED = { overview: 'Engine', wasm: 'Engine file', strings: 'Strings', globals: 'Globals', storage: 'Storage', console: 'Console' };
   function renderNav() {
-    $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}</button>`).join('');
-    $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; render(); });
+    $('nav').innerHTML = Object.entries(TABS).map(([k, v]) => `<button data-tab="${k}" class="${state.tab === k ? 'on' : ''}">${v}${k === 'watch' && watcher.on ? ' ●' : ''}${k === 'advanced' && state.files.length ? ' ⚙' : ''}</button>`).join('');
+    $('nav').querySelectorAll('button').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; if (b.dataset.tab === 'findings') state.focus = null; render(); });
   }
   function render() {
     renderNav();
-    const view = { overview, security, wasm, strings, globals, storage, console: consoleTab, report }[state.tab];
+    const view = { report: reportCard, findings, watch: watchTab, advanced, export: exportTab }[state.tab];
     $('main').innerHTML = view();
     wire[state.tab]?.();
   }
-  const wire = {};
+  // The engine tools, one sub-tab at a time.
+  function advanced() {
+    const views = { overview, wasm, strings, globals, storage, console: consoleTab };
+    return `<div class="sub">${Object.entries(ADVANCED).map(([k, v]) => `<button class="chip ${state.adv === k ? 'on' : ''}" data-adv="${k}">${v}</button>`).join('')}</div>` + views[state.adv]();
+  }
+  wire.advanced = () => {
+    shadow.querySelectorAll('[data-adv]').forEach(b => b.onclick = () => { state.adv = b.dataset.adv; render(); });
+    wire[state.adv]?.();
+  };
 
   // ---- scanning ----
   async function addWasm(url, bytes) {
@@ -1010,8 +1508,8 @@ function secretSources({ cookies, scriptTexts, files }) {
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
   }
   // Each step has a deadline: one that runs over is skipped and listed under state.skipped, never left hanging.
-  async function step(label, work, ms, fallback) {
-    status(`${label}…`);
+  async function step(label, work, ms, fallback, announce = true) {
+    if (announce) status(`${label}…`);
     let timer;
     const late = new Promise(resolve => { timer = setTimeout(() => { state.skipped.push(label); resolve(fallback); }, ms); });
     try { return await Promise.race([work(), late]); } catch { state.skipped.push(label); return fallback; } finally { clearTimeout(timer); }
@@ -1021,13 +1519,22 @@ function secretSources({ cookies, scriptTexts, files }) {
     status('reading globals…');
     try { state.globals = pageGlobals(); } catch { state.globals = []; state.skipped.push('reading globals'); }
     for (const url of wasmUrls()) await step(`reading ${url.split('/').pop().split('?')[0]}`, () => addWasm(url), 90000);
-    state.hints = await step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] });
-    state.tpTexts = await step('reading third-party scripts', thirdPartyScriptTexts, 15000, []);
-    state.storage = await step('reading storage', storageReport, 10000, { estimate: null, opfs: [], indexedDB: [], localStorage: [], caches: [] });
-    status('checking security…');
+    // These don't depend on each other, so they run side by side: the scan takes as long as the slowest one.
+    status('reading the page…');
+    [state.hints, state.tpTexts, state.storage, state.headers] = await Promise.all([
+      step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] }, false),
+      step('reading third-party scripts', thirdPartyScriptTexts, 15000, [], false),
+      step('reading storage', storageReport, 25000, { estimate: null, opfs: [], indexedDB: [], localStorage: [], caches: [] }, false),
+      step('reading security headers', pageHeaders, 9000, null, false),
+    ]);
+    status('grading…');
     runSecurity();
-    status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals${state.skipped.length ? ` · timed out: ${state.skipped.join(', ')}` : ''}`);
+    showStatus();
     render();
+  }
+
+  function showStatus() {
+    status(`${location.hostname}${state.grade ? ` · grade ${state.grade.letter}` : ''}${state.files.length ? ` · ${state.files.length} engine file${state.files.length === 1 ? '' : 's'}` : ''}${state.skipped.length ? ` · timed out: ${state.skipped.join(', ')}` : ''}`);
   }
 
   // ---- tabs ----
@@ -1061,8 +1568,7 @@ function secretSources({ cookies, scriptTexts, files }) {
       h += `</div>`;
     }
     if (state.security) {
-      const c = severityCounts(allFindings());
-      h += `<div class="card"><b>Security:</b> ${['high', 'medium', 'low'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join(' ')} <span class="dim">· see the Security tab</span></div>`;
+      h += `<div class="card"><b>Report card:</b> grade ${state.grade.letter} <span class="dim">· see the Report card tab</span></div>`;
     }
     h += `<h3>Where to start</h3>${tips().map(t => `<div class="tip">${t}</div>`).join('') || '<div class="dim">Nothing stood out yet.</div>'}`;
     h += `<h3>Scan another engine file</h3><div class="row"><input type="text" class="url" placeholder="https://…/game.wasm"><button class="btn add">Scan</button><button class="btn ghost pick">From file…</button><input type="file" class="file" accept=".wasm" hidden></div>`;
@@ -1190,35 +1696,50 @@ function secretSources({ cookies, scriptTexts, files }) {
     if (recorder.on) { const id = setInterval(() => { if (state.tab !== 'console' || !shadow.contains($('.lines'))) return clearInterval(id); show(); }, 1000); }
   };
 
+  // ---- export ----
   function reportMarkdown() {
-    const lines = [`# EngineX-ray report: ${location.host}${location.pathname}`, '', `Scanned ${new Date().toISOString()}`, ''];
-    for (const f of state.files) {
-      if (f.error) { lines.push(`## ${f.url}`, '', `Error: ${f.error}`, ''); continue; }
-      const m = f.mod;
-      lines.push(`## ${f.url.split('/').pop()}`, '', `- Engine: **${f.engine.best}** (${(f.engine.matches[0]?.evidence ?? []).join('; ')})`,
-        `- Size: ${mb(m.size)}, ${m.functions.defined} functions, ${m.exports.length} exports, ${m.imports.length} imports`,
-        `- Memory: ${m.memories.map(x => `${pagesMb(x.min)}–${pagesMb(x.max)}${x.shared ? ' shared' : ''}`).join(', ') || 'none'}`, '');
-      for (const [label, list] of Object.entries(interestingExports(m))) if (list.length) lines.push(`### ${label}`, '', list.slice(0, 100).map(x => `- \`${x}\``).join('\n'), '');
+    const g = state.grade;
+    const lines = [`# EngineX-ray report card: ${location.host}${location.pathname}`, '', `Scanned ${new Date().toISOString()}${watcher.startedAt ? ' · Live watch on' : ''}`, ''];
+    if (g) {
+      lines.push(`## Grade ${g.letter} (${g.score}/100)`, '', ...g.summary.map(x => `- ${x}`), '');
+      if (g.deductions.length) lines.push('### Why this grade', '', ...g.deductions.map(d => `- −${d.points}: ${d.why}`), '');
     }
-    lines.push('## Interesting globals', '', ...state.globals.filter(g => g.notes.length).map(g => `- \`${g.name}\` (${g.type}): ${g.notes.join('; ')}`), '');
-    const s = state.storage;
-    if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
-      ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
     if (state.security) {
-      lines.push('## Security findings', '', '_Secret values are masked._', '');
+      lines.push('## Findings', '', '_Passive checks. Secret values are masked._', '');
       for (const [section, list] of Object.entries(state.security)) {
+        if (section === 'Live watch' && !watcher.startedAt) continue;
         lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.slice(0, 12).map(clip).join('; ')}`) : ['- nothing found']), '');
       }
     }
-    lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
+    if (watcher.startedAt) {
+      const hosts = watcher.byHost();
+      lines.push('## Where data went while watching', '', '| Server | Requests | Sent | Kind | Your typing |', '|---|---|---|---|---|',
+        ...hosts.slice(0, 40).map(h => `| ${h.host} | ${h.requests} | ${(h.bytes / 1024).toFixed(1)} KB | ${hostCategory(h.host) ?? (isThirdPartyHost(h.host) ? 'other' : 'this site')} | ${h.typed.size ? [...h.typed.keys()].join(', ') : ''} |`), '');
+    }
+    if (state.files.length) {
+      lines.push('## Engine (Advanced)', '');
+      for (const f of state.files) {
+        if (f.error) { lines.push(`### ${f.url}`, '', `Error: ${f.error}`, ''); continue; }
+        const m = f.mod;
+        lines.push(`### ${f.url.split('/').pop()}`, '', `- Engine: **${f.engine.best}** (${(f.engine.matches[0]?.evidence ?? []).join('; ')})`,
+          `- Size: ${mb(m.size)}, ${m.functions.defined} functions, ${m.exports.length} exports, ${m.imports.length} imports`,
+          `- Memory: ${m.memories.map(x => `${pagesMb(x.min)}–${pagesMb(x.max)}${x.shared ? ' shared' : ''}`).join(', ') || 'none'}`, '');
+        for (const [label, list] of Object.entries(interestingExports(m))) if (list.length) lines.push(`#### ${label}`, '', list.slice(0, 100).map(x => `- \`${x}\``).join('\n'), '');
+      }
+      lines.push('### Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '');
+    }
+    const s = state.storage;
+    if (s) lines.push('## Storage', '', `- Used ${mb(s.estimate?.usage)} of ${mb(s.estimate?.quota)}`, ...s.opfs.map(o => `- OPFS \`${o.name}\`: ${mb(o.bytes)}${o.files ? `, ${o.files} files` : ''}`),
+      ...s.indexedDB.map(d => `- IndexedDB ${d}`), `- localStorage: ${s.localStorage.length} keys`, '');
+    lines.push('_Made with EngineX-ray_');
     return lines.join('\n');
   }
-  function report() {
-    return `<p>A Markdown summary of everything above, for your notes or a GitHub issue.</p>
+  function exportTab() {
+    return `<p>The report card and every finding as Markdown, for your notes, a write-up or a bug report.</p>
       <div class="row"><button class="btn copy">Copy report</button><button class="btn ghost save">Download .md</button><span class="dim done"></span></div>
       <div class="list dim">${esc(reportMarkdown())}</div>`;
   }
-  wire.report = () => {
+  wire.export = () => {
     $('.copy').onclick = async () => { try { await navigator.clipboard.writeText(reportMarkdown()); $('.done').textContent = 'Copied.'; } catch { $('.done').textContent = 'Copy blocked: use Download.'; } };
     $('.save').onclick = () => {
       const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(new Blob([reportMarkdown()], { type: 'text/markdown' })), download: `enginexray-${location.host}.md` });
@@ -1236,42 +1757,89 @@ function secretSources({ cookies, scriptTexts, files }) {
     const cookies = readCookies();
     const texts = state.hints.texts ?? [];
     state.security = {
-      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
       'Privacy': [...privacyFindings({ watcher, storage: state.storage, cookies }), ...staticFingerprinting([...texts, ...(state.tpTexts ?? [])])],
+      'Site security': [...siteSecurityFindings({ headers: state.headers }), ...libraryFindings()],
       'Secrets & tokens': secretFindings(secretSources({ cookies, scriptTexts: texts, files: state.files }), cookies),
+      'Crypto-miner': minerFindings({ files: state.files, hints: state.hints, watcher, workerTexts: texts }),
+      'Live watch': watchFindings(watcher),
     };
+    state.grade = gradeReport(state.security, thirdParties());
   }
-  const liveRefresh = debounce(() => { runSecurity(); if (state.tab === 'security' || state.tab === 'overview') render(); }, 600);
+  const liveRefresh = debounce(() => { if (!state.security) return; runSecurity(); showStatus(); if (['report', 'findings', 'watch'].includes(state.tab)) render(); }, 700);
   watcher.onChange(liveRefresh);
 
-  function security() {
-    if (!state.security) return '<div class="dim">Scanning…</div>';
-    const c = severityCounts(allFindings());
-    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Watch this page'}</button>
-      ${watcher.on ? `<span class="watching">● watching</span> <span class="dim">${watcher.events.length} API calls · ${watcher.sockets.length} sockets · ${watcher.workers.length} workers</span>` : ''}
-      <button class="btn ghost rerun">Rescan</button></div>
-      <div class="dim">Watching records fingerprinting calls, WebSocket connections and new workers <b>from the moment you switch it on</b>. Switch it on, then use the page (press Play, log in, scroll). It never blocks or changes anything.</div></div>
-      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
-    for (const [section, list] of Object.entries(state.security)) {
-      h += `<h3>${esc(section)}</h3>`;
-      if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
-      for (const f of sortFindings(list)) {
-        h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
-          <div class="list dim">${f.evidence.slice(0, 12).map(e => esc(clip(e))).join('\n')}</div>
-          <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
-      }
-    }
-    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores. It sends nothing and probes nothing. Secret values are masked.</p>`;
+  const findingCard = f => {
+    const ev = f.evidence.slice(0, 12).map(e => esc(clip(e)));
+    return `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
+      <div class="list dim">${ev.slice(0, 3).join('\n')}</div>${ev.length > 3 ? `<details><summary>${ev.length - 3} more</summary><div class="list dim">${ev.slice(3).join('\n')}</div></details>` : ''}
+      <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
+  };
+
+  // The report card: grade, summary, the areas at a glance, and why points were taken off.
+  function reportCard() {
+    const g = state.grade;
+    if (!g) return '<div class="dim">Checking this page…</div>';
+    let h = `<div class="card"><div class="grade"><div class="letter ${g.letter}">${g.letter}</div>
+        <div><div class="site">${esc(location.hostname)}</div><div class="score">${g.score}/100 · how this page treats your privacy and security</div></div></div>
+        <ul class="said">${g.summary.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>
+      <div class="tiles">${g.tiles.map(t => `<button class="tile ${t.state}" data-area="${t.area}"><b>${esc(t.label)}</b><span>${esc(t.text)}</span></button>`).join('')}</div>`;
+    h += `<h3>Why this grade</h3>`;
+    h += g.deductions.length ? `<div class="card ded">${g.deductions.map(d => `<b>−${d.points}</b><span>${esc(d.why)}</span>`).join('')}</div>` : '<div class="card ok">Nothing to take points off for.</div>';
+    h += `<div class="row"><button class="btn ghost rerun">Rescan</button>${watcher.on ? '' : '<button class="btn gowatch">Start Live watch</button>'}</div>
+      <p class="dim">Measured before you accept any cookie banner, from what this tab already loaded. ${watcher.startedAt ? 'Includes what Live watch saw.' : 'Live watch adds what happens while you use the page (typing, forms, data sent).'} Nothing is sent anywhere; secrets are masked.</p>`;
     return h;
   }
-  wire.security = () => {
-    $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); render(); };
-    $('.rerun').onclick = async () => { state.storage = await storageReport(); state.hints = await scriptHints(); state.tpTexts = await thirdPartyScriptTexts(); runSecurity(); render(); };
+  wire.report = () => {
+    if (!state.grade) return;
+    shadow.querySelectorAll('.tile').forEach(t => t.onclick = () => { if (t.dataset.area === 'watch') state.tab = 'watch'; else { state.tab = 'findings'; state.focus = t.dataset.area; } render(); });
+    $('.rerun').onclick = async () => { await scan(); };
+    $('.gowatch') && ($('.gowatch').onclick = () => { watcher.start(); state.tab = 'watch'; render(); });
   };
+
+  // Which findings sections a report-card tile opens.
+  const AREA_SECTIONS = { recording: ['Privacy'], fingerprinting: ['Privacy'], trackers: ['Privacy'], site: ['Site security'], leaks: ['Secrets & tokens'], miner: ['Crypto-miner'] };
+  function findings() {
+    if (!state.security) return '<div class="dim">Checking this page…</div>';
+    const sections = Object.entries(state.security).filter(([name]) => (!state.focus || AREA_SECTIONS[state.focus]?.includes(name)) && (name !== 'Live watch' || watcher.startedAt));
+    const c = severityCounts(sections.flatMap(([, l]) => l));
+    let h = `<div class="row">${state.focus ? `<button class="chip on all">Showing ${esc(AREA_SECTIONS[state.focus].join(', '))} · show all</button>` : ''}<button class="btn ghost rerun">Rescan</button></div>
+      <div class="summary">${['high', 'medium', 'low', 'info'].map(s => `<span class="sev ${s}">${c[s]} ${s}</span>`).join('')}</div>`;
+    for (const [section, list] of sections) {
+      h += `<h3>${esc(section)}</h3>`;
+      h += list.length ? sortFindings(list).map(findingCard).join('') : `<div class="dim">Nothing found.</div>`;
+    }
+    h += `<p class="dim">Passive checks only: EngineX-ray reads what this tab already received and stores, plus one re-read of this page for its headers. It probes nothing. Secret values are masked.</p>`;
+    return h;
+  }
+  wire.findings = () => {
+    if (!state.security) return;
+    $('.all') && ($('.all').onclick = () => { state.focus = null; render(); });
+    $('.rerun').onclick = async () => { await scan(); };
+  };
+
+  function watchTab() {
+    let h = `<div class="card"><div class="row"><button class="btn watch">${watcher.on ? 'Stop watching' : 'Start watching'}</button>
+      ${watcher.on ? '<span class="watching">● watching</span>' : ''}</div>
+      <div>Use the page like you normally would: search, open menus, fill in a form with made-up details (like <code>test.person@example.com</code>). EngineX-ray checks where each request goes, whether what you typed is in it, and which outside scripts read your fields or listen to your keys.</div>
+      <div class="dim">It sees what happens from the moment you switch it on, and never blocks or changes anything.</div></div>`;
+    if (!watcher.startedAt) return h + '<div class="dim">Not watching yet.</div>';
+    const hosts = watcher.byHost();
+    h += `<div class="summary"><span class="chip">${watcher.requests.length} requests</span><span class="chip">${hosts.length} servers</span><span class="chip">${watcher.typedCount} typed values tracked</span>
+      <span class="chip">${watcher.fieldReads.length} field reads</span><span class="chip">${watcher.keyListeners.length} key listeners</span><span class="chip">${watcher.events.length} fingerprinting calls</span></div>`;
+    const live = sortFindings(state.security?.['Live watch'] ?? []).filter(f => f.sev !== 'info');
+    h += live.length ? live.map(findingCard).join('') : `<div class="card dim">Nothing worrying seen yet. Type something into the page's search box or a form to test it.</div>`;
+    h += `<h3>Where data went</h3>`;
+    h += hosts.length ? `<table>${hosts.slice(0, 60).map(x => `<tr><td>${esc(x.host)}</td><td>${x.requests} req · ${(x.bytes / 1024).toFixed(1)} KB · <span class="dim">${esc(hostCategory(x.host) ?? (isThirdPartyHost(x.host) ? 'other company' : 'this site'))}</span>${x.typed.size ? `<div class="warn">contained your ${esc([...x.typed.keys()].join(', '))}</div>` : ''}</td></tr>`).join('')}</table>` : '<div class="dim">No requests yet.</div>';
+    const fp = [...watcher.byScript()].filter(([, t]) => t.size);
+    if (fp.length) h += `<h3>Device details read</h3><table>${fp.slice(0, 20).map(([script, techs]) => `<tr><td>${esc(clip(script.split('?')[0].split('/').slice(2).join('/')))}</td><td>${[...techs].map(([t, n]) => `${esc(t)} ×${n}`).join('<br>')}</td></tr>`).join('')}</table>`;
+    if (watcher.sockets.length || watcher.workers.length) h += `<h3>Connections and workers</h3><div class="list dim">${[...watcher.sockets.map(x => `WebSocket ${x.url}`), ...watcher.workers.map(x => `Worker ${x.url}`)].map(x => esc(clip(x))).join('\n')}</div>`;
+    return h;
+  }
+  wire.watch = () => { $('.watch').onclick = () => { watcher.on ? watcher.stop() : watcher.start(); runSecurity(); render(); }; };
 
   window.EngineXray = {
     toggle() { $('.panel').classList.toggle('hidden'); },
-    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { state.tab = t; render(); },
+    state, rescan: scan, report: reportMarkdown, watcher, runSecurity, setTab: t => { if (ADVANCED[t]) { state.adv = t; t = 'advanced'; } state.tab = t; render(); },
     addWasm: async (url, bytes) => { await addWasm(url, bytes); render(); },
   };
   render();

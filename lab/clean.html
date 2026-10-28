@@ -13,17 +13,13 @@
   <h1>Clean page</h1>
   <p class="lede">Nothing is planted here. A good scanner stays quiet on a clean page. If EngineX-ray reports anything above "info", that's a false positive to fix.</p>
   <ol class="steps">
-    <li>Click the EngineX-ray bookmark and open the Security tab.</li>
-    <li>Expect nothing found, or only "info" notes.</li>
+    <li>Click the EngineX-ray bookmark.</li>
+    <li>Expect grade A, and nothing above "info" in Findings. The server sends this page a strict security policy, so the header checks pass too.</li>
   </ol>
   <div class="card"><p>Some ordinary page content, a list of things, and a button that does ordinary things.</p>
-    <button class="run" style="background:var(--accent)" onclick="this.textContent = 'Clicked ' + (++this.dataset.n || (this.dataset.n = 1)) + '×'">Click me</button></div>
+    <button class="run" id="click" style="background:var(--accent)">Click me</button></div>
 </main>
-<script>
-  // The test range pages share one origin, so remove what secrets.html planted: this page must start clean.
-  for (const k of ["auth_token", "access_token"]) localStorage.removeItem(k);
-  document.cookie = "session=; path=/; max-age=0";
-</script>
+<script src="clean.js"></script>
 <script src="xray-button.js"></script>
 </body>
 </html>

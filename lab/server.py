@@ -37,7 +37,20 @@ def ws_send(sock, text):
 class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if self.path.split('?')[0] == '/clean.html':  # the control page gets a strict policy, so it can grade an A
+            self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
         super().end_headers()
+
+    def do_POST(self):
+        # The fake tracker on shop.html posts here. Whatever it sends is read and thrown away.
+        if self.path.startswith('/collect'):
+            self.rfile.read(int(self.headers.get('Content-Length') or 0))
+            self.send_response(204)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            return
+        self.send_error(404)
 
     def do_GET(self):
         if self.path.startswith('/stratum') and self.headers.get('Upgrade', '').lower() == 'websocket':

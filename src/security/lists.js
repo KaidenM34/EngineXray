@@ -60,6 +60,9 @@ export const SECRET_PATTERNS = [
 export const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
 export const SESSION_COOKIE = /sess|\bsid\b|auth|token|jwt|login|remember|access|refresh/i;
 export const NOT_SESSION_COOKIE = /^(_ga|_gid|_gcl|_fbp|_fbc|__cf|cf_|_hj|ajs_|amplitude|mp_|_clck|_clsk|csrf|xsrf|_csrf|cookie_?consent|OptanonConsent)/i;
+// Session-named cookies and keys that belong to analytics, ad, feedback and bot-check vendors (seen in the 20-site
+// survey): they identify a visit, not a login. Reported as low, not as an exposed login session.
+export const VISITOR_SESSION = /^(aws-waf-token|_pin_unauth)$|^(ab\.storage|kampyle|__attentive|_parsely|optimizely|blaize|bcsession|logglytracking|gc_session|mgnisession|__milesession|s_sess$|as_session_id|cet-page_session|bf-xdomain|foxkit|ebay-rum|session_landing|_sdsat|ffsession|app_session_id|poki_session)|rum-session|session-data$/i;
 export const TRACKING_ID_KEYS = /^(_ga|_gid|_fbp|_fbc|ajs_anonymous_id|ajs_user_id|amplitude_id|_hjSessionUser|_clck|mp_.*_mixpanel|__hstc|hubspotutk|_uetvid|_pin_unauth|_tt_enable_cookie|_ttp)/i;
 
 export function hostCategory(hostname) {
@@ -71,3 +74,7 @@ export function hostCategory(hostname) {
 export function isMinerHost(hostname) {
   return MINER_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d));
 }
+
+// Another site than this page's (compared by the last two name parts, so cdn.example.com counts as example.com).
+const siteOf = host => host.split('.').slice(-2).join('.');
+export const isThirdPartyHost = host => !!host && host !== location.hostname && siteOf(host) !== siteOf(location.hostname);

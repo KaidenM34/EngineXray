@@ -216,7 +216,10 @@ const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 function timedFetch(url, opts = {}, ms = 8000) {
 const ctrl = new AbortController();
 const timer = setTimeout(() => ctrl.abort(), ms);
-return fetch(url, { ...opts, signal: ctrl.signal }).then(res => {
+timedFetch.busy = (timedFetch.busy ?? 0) + 1;
+let started;
+try { started = fetch(url, { ...opts, signal: ctrl.signal }); } finally { timedFetch.busy--; }
+return started.then(res => {
 const read = kind => () => res[kind]().finally(() => clearTimeout(timer));
 return { ok: res.ok, status: res.status, headers: res.headers, text: read('text'), arrayBuffer: read('arrayBuffer') };
 }, e => { clearTimeout(timer); throw e; });
@@ -426,6 +429,7 @@ const SECRET_PATTERNS = [
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
 const SESSION_COOKIE = /sess|\bsid\b|auth|token|jwt|login|remember|access|refresh/i;
 const NOT_SESSION_COOKIE = /^(_ga|_gid|_gcl|_fbp|_fbc|__cf|cf_|_hj|ajs_|amplitude|mp_|_clck|_clsk|csrf|xsrf|_csrf|cookie_?consent|OptanonConsent)/i;
+const VISITOR_SESSION = /^(aws-waf-token|_pin_unauth)$|^(ab\.storage|kampyle|__attentive|_parsely|optimizely|blaize|bcsession|logglytracking|gc_session|mgnisession|__milesession|s_sess$|as_session_id|cet-page_session|bf-xdomain|foxkit|ebay-rum|session_landing|_sdsat|ffsession|app_session_id|poki_session)|rum-session|session-data$/i;
 const TRACKING_ID_KEYS = /^(_ga|_gid|_fbp|_fbc|ajs_anonymous_id|ajs_user_id|amplitude_id|_hjSessionUser|_clck|mp_.*_mixpanel|__hstc|hubspotutk|_uetvid|_pin_unauth|_tt_enable_cookie|_ttp)/i;
 function hostCategory(hostname) {
 for (const [category, domains] of Object.entries(TRACKERS)) {
@@ -436,6 +440,8 @@ return null;
 function isMinerHost(hostname) {
 return MINER_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d));
 }
+const siteOf = host => host.split('.').slice(-2).join('.');
+const isThirdPartyHost = host => !!host && host !== location.hostname && siteOf(host) !== siteOf(location.hostname);
 function cryptoConstants(mod) {
 const found = new Map();
 const byPrefix = new Map();
@@ -558,7 +564,8 @@ means: 'Games and graphics apps read these to pick settings. One or two on their
 }
 }
 const ids = [];
-for (const k of storage?.localStorage ?? []) if (TRACKING_ID_KEYS.test(k.key)) ids.push(`localStorage ${k.key}`);
+let keys = []; try { keys = Object.keys(localStorage); } catch { keys = (storage?.localStorage ?? []).map(k => k.key); }
+for (const k of keys) if (TRACKING_ID_KEYS.test(k)) ids.push(`localStorage ${k}`);
 for (const c of cookies) if (TRACKING_ID_KEYS.test(c.name)) ids.push(`cookie ${c.name}`);
 if (ids.length) findings.push({ sev: 'low', title: `${ids.length} tracking ID${ids.length > 1 ? 's' : ''} stored in your browser`, evidence: ids,
 means: 'Long-lived IDs that let analytics and ad services recognize you on your next visit.', todo: 'Clearing this site\'s data resets them.' });
@@ -585,6 +592,56 @@ todo: 'Watch the page to see whether it actually runs. Browsers with fingerprint
 }
 return findings;
 }
+const hostOfScript = s => { try { return new URL(s).hostname; } catch { return ''; } };
+function watchFindings(watcher) {
+if (!watcher.startedAt) return [];
+const findings = [];
+const hosts = watcher.byHost();
+for (const h of hosts.filter(h => h.typed.size)) {
+const third = isThirdPartyHost(h.host), sensitive = [...h.typed.values()].some(Boolean);
+const cat = hostCategory(h.host);
+findings.push(third
+? { sev: sensitive ? 'high' : 'medium', title: `What you typed was sent to ${h.host}`, evidence: [`${h.host}${cat ? ` (${cat})` : ''}`, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+means: sensitive ? 'Text from a personal field (password, email, phone or card) left the page for another company\'s server.' : 'Text you typed went to another company\'s server, often search terms sent to analytics or ad partners.',
+todo: sensitive ? 'Don\'t enter real details on this page unless you trust that company with them.' : 'Avoid typing anything private into this page.' }
+: { sev: 'info', title: 'What you typed was sent to the site itself', evidence: [h.host, ...[...h.typed.keys()].map(f => `from your ${f}`)],
+means: 'Normal for search boxes, autocomplete and forms.', todo: 'Nothing.' });
+}
+const readers = new Map();
+for (const r of watcher.fieldReads) {
+const host = hostOfScript(r.script);
+if (!isThirdPartyHost(host)) continue;
+const x = readers.get(host) ?? { scripts: new Set(), fields: new Set() };
+x.scripts.add(r.script.split('?')[0]); x.fields.add(r.field); readers.set(host, x);
+}
+for (const [host, x] of readers) {
+const secret = [...x.fields].some(f => /password|card|cc-|cvc|cvv|ssn|iban/i.test(f));
+findings.push({ sev: secret ? 'high' : 'medium', title: `A script from ${host} read your ${secret ? 'password or card field' : 'personal fields'}`, evidence: [...x.scripts, ...x.fields],
+means: 'A third-party script on this page read what you entered. Session-replay and analytics tools do this; so does a card skimmer (Magecart).',
+todo: secret ? 'Don\'t enter real passwords or card numbers here unless you trust this company.' : 'Expect what you type here to be shared with that company.' });
+}
+const keyHosts = new Map();
+for (const k of watcher.keyListeners) {
+const host = hostOfScript(k.script);
+if (isThirdPartyHost(host)) (keyHosts.get(host) ?? keyHosts.set(host, new Set()).get(host)).add(`${k.type} on ${k.target}`);
+}
+for (const [host, what] of keyHosts) {
+const onField = [...what].some(w => /<(input|textarea)/.test(w));
+findings.push({ sev: onField ? 'medium' : 'low', title: `A script from ${host} listens to your keystrokes${onField ? ' in form fields' : ''}`, evidence: [...what].slice(0, 6),
+means: (onField ? 'It attached to the fields you type in. Session-replay tools and card skimmers do this to capture what you enter.' :
+'It listens on the whole page. Ad-verification and bot-detection scripts do this to check a person is there, usually noting that keys were pressed, not which.') +
+' "What you typed was sent to…" (above, if present) shows whether your text actually left the page.',
+todo: onField ? 'Check what that company is before typing anything private here.' : 'Nothing, unless your typing also shows up in its requests.' });
+}
+const out = hosts.filter(h => isThirdPartyHost(h.host));
+if (out.length) {
+const kb = out.reduce((n, h) => n + h.bytes, 0) / 1024;
+findings.push({ sev: 'info', title: `${out.length} other server${out.length > 1 ? 's' : ''} received data while watching (${kb.toFixed(kb < 10 ? 1 : 0)} KB)`,
+evidence: out.slice(0, 8).map(h => `${h.host}: ${h.requests} request${h.requests > 1 ? 's' : ''}, ${(h.bytes / 1024).toFixed(1)} KB${hostCategory(h.host) ? ` (${hostCategory(h.host)})` : ''}`),
+means: 'Every server outside this site that the page sent something to since you started watching.', todo: 'The Live watch tab lists them all.' });
+}
+return findings;
+}
 const mask = s => s.length <= 8 ? '•'.repeat(s.length) : `${s.slice(0, 4)}…${s.slice(-2)} (${s.length} chars)`;
 function b64urlJson(part) {
 try { return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '='))); } catch { return null; }
@@ -598,6 +655,7 @@ const findings = [], seen = new Set();
 for (const { where, text, kind, key } of sources) {
 if (!text) continue;
 if (kind === 'storage' && key && SESSION_COOKIE.test(key) && !NOT_SESSION_COOKIE.test(key) && /^[\w\-.~+/=]{20,}$/.test(text) && !new RegExp(JWT.source).test(text)) {
+if (VISITOR_SESSION.test(key)) { findings.push(visitorSession(where, text)); continue; }
 findings.push({ sev: 'medium', title: `Token-like value in ${where.split('[')[0]}`, evidence: [mask(text), where],
 means: 'Something stored under a login/session name. Storage like this can be read by any script on the page, so an XSS bug can steal it.',
 todo: 'If it\'s your app: keep session tokens in HttpOnly, Secure, SameSite cookies.' });
@@ -639,10 +697,16 @@ todo: none ? 'If it\'s your app: make the server reject alg "none" and always ve
 }
 for (const c of cookies) {
 if (!SESSION_COOKIE.test(c.name) || NOT_SESSION_COOKIE.test(c.name) || new RegExp(JWT.source).test(c.value)) continue; // JWTs reported above
+if (c.value.length < 16 || /^(\{|%7B)/i.test(c.value)) continue; // a flag, counter or JSON blob, not a session token
+if (VISITOR_SESSION.test(c.name)) { findings.push(visitorSession(`cookie ${c.name}`, c.value)); continue; }
 findings.push({ sev: 'medium', title: `Session cookie "${c.name}" is readable by scripts`, evidence: [mask(c.value), 'document.cookie'],
 means: 'It isn\'t marked HttpOnly, so any script on the page (including an XSS attack) can read and steal it.', todo: 'If it\'s your site: set HttpOnly (and Secure, SameSite) on session cookies.' });
 }
 return findings;
+}
+function visitorSession(where, value) {
+return { sev: 'low', title: `Visitor session ID readable by scripts (${where.replace(/^cookie /, '').slice(0, 40)})`, evidence: [mask(value), where],
+means: 'Named like a session, but it belongs to an analytics, ad or bot-check service: it identifies this visit, not your login.', todo: 'Nothing. Clearing this site\'s data resets it.' };
 }
 function secretSources({ cookies, scriptTexts, files }) {
 const sources = [];
