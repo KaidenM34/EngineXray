@@ -46,7 +46,7 @@ Then open http://127.0.0.1:8790/. Each test page has a **Run EngineX-ray** butto
 
   This is everything that took hours to find by hand for bo1fun.
 - **A skate fan game (Rust + wasm-bindgen, 61 MB, loaded from a worker).** Found the engine through the page's scripts, plus the `mods-worker.js` worker. The JS bridge list showed its mod API (`modsLoad`, `modsCall`, `modsUnload`).
-- **The report card on real sites:** The Verge graded C–D, almost all for its ad networks (24–31 ad servers, 97–111 outside servers per load); Live watch caught an ad-verification script listening to keystrokes on the whole page. United's flight search shows Quantum Metric session replay. A 20-site survey of game portals, news, shopping and student sites is in `survey/`.
+- **The report card on real sites:** The Verge graded C–D, almost all for its ad networks (24–31 ad servers, 97–111 outside servers per load); Live watch caught an ad-verification script listening to keystrokes on the whole page. United's flight search shows Quantum Metric session replay. I also ran it on 20 popular game portals, news, shopping and student sites; no leaked keys or miners turned up, and the write-up is coming.
 - **Security checks on real sites:** both game engines above come back as "standard crypto tables" (info), not miners. Testing on them caught and fixed one false positive (`XMRigid` matching the XMRig miner). A major news site showed 112 third-party hosts, 31 of them ad networks.
 - Unity and Godot fingerprints are written but not yet tested on a real game.
 

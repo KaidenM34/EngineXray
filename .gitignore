@@ -1,1 +1,4 @@
 .DS_Store
+# Raw survey data names sites next to their findings: kept local, only aggregates are published.
+survey/results.jsonl
+survey/PRIVATE_NOTES.md
