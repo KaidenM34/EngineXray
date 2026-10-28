@@ -14,6 +14,17 @@ export function wasmUrls() {
 // and tracker names, so it must never scan itself.
 export const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 
+// fetch with a time limit. A request that never answers (a held-open connection, an extension sitting on it) would
+// otherwise stall the whole scan; this one gives up and the caller skips that file. The limit covers the body too.
+export function timedFetch(url, opts = {}, ms = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...opts, signal: ctrl.signal }).then(res => {
+    const read = kind => () => res[kind]().finally(() => clearTimeout(timer));
+    return { ok: res.ok, status: res.status, headers: res.headers, text: read('text'), arrayBuffer: read('arrayBuffer') };
+  }, e => { clearTimeout(timer); throw e; });
+}
+
 // Resolved against the page and never throws: some sites hand back relative or odd script URLs.
 const absUrl = u => { try { return new URL(u, location.href); } catch { return null; } };
 
@@ -24,11 +35,12 @@ export async function scriptHints() {
   const wasm = new Map(), workers = new Set(), texts = [];
   const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
   while (queue.length && done.size < 40) {
-    const src = queue.shift();
-    if (done.has(src)) continue; done.add(src);
-    let text = '';
-    try { text = await (await fetch(src)).text(); } catch { continue; }
-    if (text.length > 5e6) continue;
+    // Eight at a time, so a few slow files can't use up the step's deadline.
+    const batch = [...new Set(queue.splice(0, 8))].filter(u => !done.has(u));
+    batch.forEach(u => done.add(u));
+    const read = await Promise.all(batch.map(src => timedFetch(src).then(r => r.text()).then(text => [src, text], () => [src, ''])));
+    for (const [src, text] of read) {
+    if (!text || text.length > 5e6) continue;
     texts.push([src.split('/').pop().split('?')[0] || src, text]);
     for (const m of text.matchAll(/["'`]([^"'`\s]*?\.wasm)[^"'`\s]*["'`]/g)) {
       const raw = m[1], plain = raw.replace(/\$\{[^}]*\}/g, '').replace(/-+(?=\.wasm$)/, '');
@@ -37,6 +49,7 @@ export async function scriptHints() {
     for (const m of text.matchAll(/new (?:Shared)?Worker\(\s*(?:new URL\()?\s*["'`]([^"'`]+)["'`]/g)) {
       workers.add(m[1]);
       try { const u = new URL(m[1].replace(/\$\{[^}]*\}/g, ''), src); if (u.origin === location.origin) queue.push(u.href); } catch {} // read worker code too
+    }
     }
   }
   return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...workers], texts };
@@ -50,7 +63,7 @@ export async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
   const out = [];
   await Promise.all(urls.map(async url => {
     try {
-      const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
+      const res = await timedFetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
       if (!res.ok) return;
       const text = await res.text();
       if (text.length <= maxBytes) out.push([absUrl(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
@@ -60,7 +73,7 @@ export async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
 }
 
 export async function fetchWasm(url) {
-  const res = await fetch(url);
+  const res = await timedFetch(url, {}, 60000);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return new Uint8Array(await res.arrayBuffer());
 }

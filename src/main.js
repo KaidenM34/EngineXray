@@ -11,7 +11,7 @@
   const pagesMb = p => p == null ? 'no limit' : mb(p * 65536);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 
-  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
+  const state = { files: [], globals: [], storage: null, hints: { wasm: [], workers: [] }, skipped: [], tab: 'overview', stringQuery: '', stringPreset: null, onlyInteresting: true };
   const recorder = consoleRecorder();
   const watcher = createWatcher();
   state.security = null;
@@ -104,15 +104,24 @@
     }
     status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
   }
+  // Each step has a deadline: one that runs over is skipped and listed under state.skipped, never left hanging.
+  async function step(label, work, ms, fallback) {
+    status(`${label}…`);
+    let timer;
+    const late = new Promise(resolve => { timer = setTimeout(() => { state.skipped.push(label); resolve(fallback); }, ms); });
+    try { return await Promise.race([work(), late]); } catch { state.skipped.push(label); return fallback; } finally { clearTimeout(timer); }
+  }
   async function scan() {
-    status('scanning…');
+    state.skipped = [];
+    status('reading globals…');
     state.globals = pageGlobals();
-    for (const url of wasmUrls()) await addWasm(url);
-    state.hints = await scriptHints();
-    state.tpTexts = await thirdPartyScriptTexts();
-    state.storage = await storageReport();
+    for (const url of wasmUrls()) await step(`reading ${url.split('/').pop().split('?')[0]}`, () => addWasm(url), 90000);
+    state.hints = await step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] });
+    state.tpTexts = await step('reading third-party scripts', thirdPartyScriptTexts, 15000, []);
+    state.storage = await step('reading storage', storageReport, 10000, { estimate: null, opfs: [], indexedDB: [], localStorage: [], caches: [] });
+    status('checking security…');
     runSecurity();
-    status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals`);
+    status(`${state.files.length} engine file${state.files.length === 1 ? '' : 's'} · ${state.globals.length} globals${state.skipped.length ? ` · timed out: ${state.skipped.join(', ')}` : ''}`);
     render();
   }
 
