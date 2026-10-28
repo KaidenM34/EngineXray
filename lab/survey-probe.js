@@ -278,11 +278,16 @@ frame.remove();
 const out = [];
 for (const name of Object.getOwnPropertyNames(window)) {
 if (baseline.has(name) || /^(on|webkit)/.test(name) || name === 'EngineXray') continue;
-let value, type;
+let value, type, notes = [];
 try { value = window[name]; type = describeType(value); } catch { type = 'unreadable'; }
-out.push({ name, type, notes: notesFor(name, value) });
+if (type === 'unreadable' && isCrossOriginWindow(value)) type = 'frame from another site';
+try { notes = notesFor(name, value); } catch { notes = type === 'frame from another site' ? [] : ['could not be read']; }
+out.push({ name, type, notes });
 }
 return out.sort((a, b) => b.notes.length - a.notes.length || a.name.localeCompare(b.name));
+}
+function isCrossOriginWindow(v) {
+try { return v != null && v.window === v && v !== window && (v.document, false); } catch { return true; }
 }
 function describeType(v) {
 if (v === null) return 'null';

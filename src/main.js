@@ -114,7 +114,7 @@
   async function scan() {
     state.skipped = [];
     status('reading globals…');
-    state.globals = pageGlobals();
+    try { state.globals = pageGlobals(); } catch { state.globals = []; state.skipped.push('reading globals'); }
     for (const url of wasmUrls()) await step(`reading ${url.split('/').pop().split('?')[0]}`, () => addWasm(url), 90000);
     state.hints = await step('reading page scripts', scriptHints, 30000, { wasm: [], workers: [], texts: [] });
     state.tpTexts = await step('reading third-party scripts', thirdPartyScriptTexts, 15000, []);
