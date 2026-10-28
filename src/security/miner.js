@@ -30,8 +30,8 @@ export function minerFindings({ files, hints, watcher, workerTexts }) {
   const findings = [];
   const strongText = [], weakText = [];
   const check = (where, text) => {
-    const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0]}" in ${where}`);
-    const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0]}" in ${where}`);
+    const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0].slice(0, 60)}" in ${where}`);
+    const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0].slice(0, 60)}" in ${where}`);
   };
 
   // 1. Known miner services loaded by the page.

@@ -213,10 +213,11 @@ const urls = performance.getEntriesByType('resource').map(e => e.name).filter(u 
 return [...new Set(urls)];
 }
 const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
+const absUrl = u => { try { return new URL(u, location.href); } catch { return null; } };
 async function scriptHints() {
 const scripts = performance.getEntriesByType('resource')
-.filter(e => e.initiatorType === 'script' && new URL(e.name).origin === location.origin).map(e => e.name);
-for (const s of document.scripts) if (s.src && new URL(s.src).origin === location.origin) scripts.push(s.src);
+.filter(e => e.initiatorType === 'script' && absUrl(e.name)?.origin === location.origin).map(e => e.name);
+for (const s of document.scripts) { const u = s.src && absUrl(s.src); if (u?.origin === location.origin) scripts.push(u.href); }
 const wasm = new Map(), workers = new Set(), texts = [];
 const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
 while (queue.length && done.size < 40) {
@@ -239,14 +240,14 @@ return { wasm: [...wasm].map(([url, info]) => ({ url, ...info })), workers: [...
 }
 async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
 const urls = [...new Set(performance.getEntriesByType('resource')
-.filter(e => e.initiatorType === 'script' && new URL(e.name).origin !== location.origin).map(e => e.name))].slice(0, max);
+.filter(e => e.initiatorType === 'script' && (absUrl(e.name)?.origin ?? location.origin) !== location.origin).map(e => e.name))].slice(0, max);
 const out = [];
 await Promise.all(urls.map(async url => {
 try {
 const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
 if (!res.ok) return;
 const text = await res.text();
-if (text.length <= maxBytes) out.push([new URL(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
+if (text.length <= maxBytes) out.push([absUrl(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
 } catch {}
 }));
 return out;
@@ -369,8 +370,8 @@ const MINER_DOMAINS = [
 'webminepool.com', 'minero.cc', 'jsecoin.com', 'ppoi.org', 'monerominer.rocks', 'cryptonoter.com', 'coinhave.com',
 'webmine.cz', 'webmine.pro', 'coinpot.co', 'hashing.win', 'mineralt.io', 'freecontent.bid', 'deepminer.net',
 ];
-const MINER_STRONG = /cryptonight|cryptonite|randomx|coinhive|coin-hive|cryptoloot|crypto-loot|coinimp|webminepool|deepminer|\bxmrig\b|stratum\+(tcp|ssl)|mining\.(subscribe|notify|authorize)|getHashesPerSecond|hashesPerSecond|setThrottle/i;
-const MINER_WEAK = /\bmonero\b|\bxmr\b|hashrate|\bnonce\b.*\btarget\b|job_id|\bgroestl\b|\bskein\b|\bjh256\b|blake256/i;
+const MINER_STRONG = /cryptonight|cryptonite|randomx|coinhive|coin-hive|cryptoloot|crypto-loot|coinimp|webminepool|deepminer|\bxmrig\b|stratum\+(tcp|ssl)|mining\.(subscribe|notify|authorize)|\bgetHashesPerSecond\b|\bhashesPerSecond\b/i;
+const MINER_WEAK = /\bmonero\b|\bxmr\b|hashrate|\bnonce\b.{0,40}\btarget\b|job_id|\bgroestl\b|\bskein\b|\bjh256\b|blake256|\bsetThrottle\b/i;
 const POOL_URL = /pool|stratum|xmr|monero|miner|mining|hashvault|nanopool|supportxmr|minexmr/i;
 const STRATUM_FRAME = /"(method|type)"\s*:\s*"(login|submit|job|getjob|keepalived|mining\.\w+)"/i;
 const CRYPTO_CONSTANTS = [
@@ -382,10 +383,10 @@ const CRYPTO_CONSTANTS = [
 { id: 'blake2b', name: 'SHA-512 / BLAKE2b initial values', bytes: [0x08, 0xc9, 0xbc, 0xf3, 0x67, 0xe6, 0x09, 0x6a] },
 ];
 const TRACKERS = {
-'session replay': ['hotjar.com', 'hotjar.io', 'fullstory.com', 'logrocket.com', 'logrocket.io', 'lr-ingest.io', 'clarity.ms',
+'session replay': ['hotjar.com', 'hotjar.io', 'sr-client-cfg.amplitude.com', 'api-sr.amplitude.com', 'fullstory.com', 'logrocket.com', 'logrocket.io', 'lr-ingest.io', 'clarity.ms',
 'mouseflow.com', 'smartlook.com', 'inspectlet.com', 'luckyorange.com', 'quantummetric.com', 'contentsquare.net', 'glassboxdigital.io'],
 'fingerprinting / bot detection': ['fpjs.io', 'fpcdn.io', 'fingerprint.com', 'fingerprintjs.com', 'online-metrix.net', 'iovation.com',
-'px-cdn.net', 'perimeterx.net', 'datadome.co', 'kasada.io', 'arkoselabs.com'],
+'px-cdn.net', 'px-cloud.net', 'pxchk.net', 'perimeterx.net', 'humansecurity.com', 'datadome.co', 'kasada.io', 'arkoselabs.com'],
 'ads': ['doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'adnxs.com', 'amazon-adsystem.com', 'criteo.com',
 'criteo.net', 'taboola.com', 'outbrain.com', 'adsrvr.org', 'rubiconproject.com', 'pubmatic.com', 'openx.net', 'casalemedia.com',
 'moatads.com', 'adform.net', 'bat.bing.com', 'ads-twitter.com', 'ads.linkedin.com', 'sharethrough.com', 'teads.tv', '33across.com'],
@@ -448,8 +449,8 @@ function minerFindings({ files, hints, watcher, workerTexts }) {
 const findings = [];
 const strongText = [], weakText = [];
 const check = (where, text) => {
-const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0]}" in ${where}`);
-const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0]}" in ${where}`);
+const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0].slice(0, 60)}" in ${where}`);
+const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0].slice(0, 60)}" in ${where}`);
 };
 const hosts = performance.getEntriesByType('resource').map(e => { try { return new URL(e.name).hostname; } catch { return ''; } });
 const minerHosts = [...new Set(hosts.filter(isMinerHost))];
@@ -607,6 +608,13 @@ const exp = typeof claims?.exp === 'number' ? new Date(claims.exp * 1000) : null
 const facts = [`alg: ${alg}`, exp ? `expires ${exp.toISOString().slice(0, 10)}${exp < new Date() ? ' (expired)' : ''}` : 'no expiry', claims?.iss ? `issuer: ${claims.iss}` : null,
 claims ? `claims: ${Object.keys(claims).slice(0, 8).join(', ')}` : null].filter(Boolean);
 const none = alg.toLowerCase() === 'none';
+const authLike = claims && Object.keys(claims).some(k => /^(sub|email|user(_?id|name)?|uid|role|roles|scope|scp|aud|permissions|groups|admin)$/i.test(k));
+if (!authLike) {
+findings.push({ sev: 'low', title: `${none ? 'Unsigned tracking' : 'Tracking'} token (JWT) in ${kind === 'code' ? 'the page\'s code' : kind}`, evidence: [mask(token), where, ...facts],
+means: 'A JWT with no login or permission claims: usually a visitor ID from an ad, analytics or identity vendor. It identifies your browser to them; it isn\'t a key to an account.' + (none ? ' It\'s unsigned, so it only matters if some server trusts it.' : ''),
+todo: 'Clearing this site\'s data resets it.' });
+continue;
+}
 findings.push({ sev: none ? 'high' : kind === 'code' ? 'medium' : 'medium', title: `Login token (JWT) in ${kind === 'code' ? 'the page\'s code' : kind}`,
 evidence: [mask(token), where, ...facts],
 means: (none ? 'Its algorithm is "none": it has no signature, so if the server accepts it, anyone can forge one. ' : '') +

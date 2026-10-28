@@ -5,6 +5,8 @@
   if (window.EngineXray) { window.EngineXray.toggle(); return; }
 
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  // Evidence comes from page code and can be huge (minified bundles), so one line never shows more than 160 characters.
+  const clip = e => { e = String(e); return e.length > 160 ? e.slice(0, 160) + '…' : e; };
   const mb = n => n == null ? '?' : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B';
   const pagesMb = p => p == null ? 'no limit' : mb(p * 65536);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
@@ -291,7 +293,7 @@
     if (state.security) {
       lines.push('## Security findings', '', '_Secret values are masked._', '');
       for (const [section, list] of Object.entries(state.security)) {
-        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.join('; ')}`) : ['- nothing found']), '');
+        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.slice(0, 12).map(clip).join('; ')}`) : ['- nothing found']), '');
       }
     }
     lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
@@ -341,7 +343,7 @@
       if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
       for (const f of sortFindings(list)) {
         h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
-          <div class="list dim">${f.evidence.map(esc).join('\n')}</div>
+          <div class="list dim">${f.evidence.slice(0, 12).map(e => esc(clip(e))).join('\n')}</div>
           <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
       }
     }

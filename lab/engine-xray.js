@@ -256,10 +256,13 @@ function wasmUrls() {
 // and tracker names, so it must never scan itself.
 const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 
+// Resolved against the page and never throws: some sites hand back relative or odd script URLs.
+const absUrl = u => { try { return new URL(u, location.href); } catch { return null; } };
+
 async function scriptHints() {
   const scripts = performance.getEntriesByType('resource')
-    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin === location.origin).map(e => e.name);
-  for (const s of document.scripts) if (s.src && new URL(s.src).origin === location.origin) scripts.push(s.src);
+    .filter(e => e.initiatorType === 'script' && absUrl(e.name)?.origin === location.origin).map(e => e.name);
+  for (const s of document.scripts) { const u = s.src && absUrl(s.src); if (u?.origin === location.origin) scripts.push(u.href); }
   const wasm = new Map(), workers = new Set(), texts = [];
   const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
   while (queue.length && done.size < 40) {
@@ -285,14 +288,14 @@ async function scriptHints() {
 // the same files the page already downloaded, usually straight from cache; scripts that don't allow it are skipped.
 async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
   const urls = [...new Set(performance.getEntriesByType('resource')
-    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin !== location.origin).map(e => e.name))].slice(0, max);
+    .filter(e => e.initiatorType === 'script' && (absUrl(e.name)?.origin ?? location.origin) !== location.origin).map(e => e.name))].slice(0, max);
   const out = [];
   await Promise.all(urls.map(async url => {
     try {
       const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
       if (!res.ok) return;
       const text = await res.text();
-      if (text.length <= maxBytes) out.push([new URL(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
+      if (text.length <= maxBytes) out.push([absUrl(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
     } catch {}
   }));
   return out;
@@ -435,8 +438,8 @@ const MINER_DOMAINS = [
 ];
 
 // Text that shows up inside browser miners (JS, worker scripts or wasm strings / function names).
-const MINER_STRONG = /cryptonight|cryptonite|randomx|coinhive|coin-hive|cryptoloot|crypto-loot|coinimp|webminepool|deepminer|\bxmrig\b|stratum\+(tcp|ssl)|mining\.(subscribe|notify|authorize)|getHashesPerSecond|hashesPerSecond|setThrottle/i;
-const MINER_WEAK = /\bmonero\b|\bxmr\b|hashrate|\bnonce\b.*\btarget\b|job_id|\bgroestl\b|\bskein\b|\bjh256\b|blake256/i;
+const MINER_STRONG = /cryptonight|cryptonite|randomx|coinhive|coin-hive|cryptoloot|crypto-loot|coinimp|webminepool|deepminer|\bxmrig\b|stratum\+(tcp|ssl)|mining\.(subscribe|notify|authorize)|\bgetHashesPerSecond\b|\bhashesPerSecond\b/i;
+const MINER_WEAK = /\bmonero\b|\bxmr\b|hashrate|\bnonce\b.{0,40}\btarget\b|job_id|\bgroestl\b|\bskein\b|\bjh256\b|blake256|\bsetThrottle\b/i;
 // WebSocket URLs that look like a mining pool or proxy.
 const POOL_URL = /pool|stratum|xmr|monero|miner|mining|hashvault|nanopool|supportxmr|minexmr/i;
 // JSON-RPC methods of the stratum mining protocol (also used over WebSocket by browser miners).
@@ -455,10 +458,10 @@ const CRYPTO_CONSTANTS = [
 
 // Third-party services by category. Matched on the end of the hostname.
 const TRACKERS = {
-  'session replay': ['hotjar.com', 'hotjar.io', 'fullstory.com', 'logrocket.com', 'logrocket.io', 'lr-ingest.io', 'clarity.ms',
+  'session replay': ['hotjar.com', 'hotjar.io', 'sr-client-cfg.amplitude.com', 'api-sr.amplitude.com', 'fullstory.com', 'logrocket.com', 'logrocket.io', 'lr-ingest.io', 'clarity.ms',
     'mouseflow.com', 'smartlook.com', 'inspectlet.com', 'luckyorange.com', 'quantummetric.com', 'contentsquare.net', 'glassboxdigital.io'],
   'fingerprinting / bot detection': ['fpjs.io', 'fpcdn.io', 'fingerprint.com', 'fingerprintjs.com', 'online-metrix.net', 'iovation.com',
-    'px-cdn.net', 'perimeterx.net', 'datadome.co', 'kasada.io', 'arkoselabs.com'],
+    'px-cdn.net', 'px-cloud.net', 'pxchk.net', 'perimeterx.net', 'humansecurity.com', 'datadome.co', 'kasada.io', 'arkoselabs.com'],
   'ads': ['doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'adnxs.com', 'amazon-adsystem.com', 'criteo.com',
     'criteo.net', 'taboola.com', 'outbrain.com', 'adsrvr.org', 'rubiconproject.com', 'pubmatic.com', 'openx.net', 'casalemedia.com',
     'moatads.com', 'adform.net', 'bat.bing.com', 'ads-twitter.com', 'ads.linkedin.com', 'sharethrough.com', 'teads.tv', '33across.com'],
@@ -638,8 +641,8 @@ function minerFindings({ files, hints, watcher, workerTexts }) {
   const findings = [];
   const strongText = [], weakText = [];
   const check = (where, text) => {
-    const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0]}" in ${where}`);
-    const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0]}" in ${where}`);
+    const s = MINER_STRONG.exec(text); if (s) strongText.push(`"${s[0].slice(0, 60)}" in ${where}`);
+    const w = MINER_WEAK.exec(text); if (w) weakText.push(`"${w[0].slice(0, 60)}" in ${where}`);
   };
 
   // 1. Known miner services loaded by the page.
@@ -833,6 +836,15 @@ function secretFindings(sources, cookies) {
       const facts = [`alg: ${alg}`, exp ? `expires ${exp.toISOString().slice(0, 10)}${exp < new Date() ? ' (expired)' : ''}` : 'no expiry', claims?.iss ? `issuer: ${claims.iss}` : null,
         claims ? `claims: ${Object.keys(claims).slice(0, 8).join(', ')}` : null].filter(Boolean);
       const none = alg.toLowerCase() === 'none';
+      // Ad-tech and analytics vendors also use JWTs, as visitor IDs. Only tokens carrying identity/permission claims
+      // are login tokens; the rest are tracking IDs (still worth listing, not an account risk).
+      const authLike = claims && Object.keys(claims).some(k => /^(sub|email|user(_?id|name)?|uid|role|roles|scope|scp|aud|permissions|groups|admin)$/i.test(k));
+      if (!authLike) {
+        findings.push({ sev: 'low', title: `${none ? 'Unsigned tracking' : 'Tracking'} token (JWT) in ${kind === 'code' ? 'the page\'s code' : kind}`, evidence: [mask(token), where, ...facts],
+          means: 'A JWT with no login or permission claims: usually a visitor ID from an ad, analytics or identity vendor. It identifies your browser to them; it isn\'t a key to an account.' + (none ? ' It\'s unsigned, so it only matters if some server trusts it.' : ''),
+          todo: 'Clearing this site\'s data resets it.' });
+        continue;
+      }
       findings.push({ sev: none ? 'high' : kind === 'code' ? 'medium' : 'medium', title: `Login token (JWT) in ${kind === 'code' ? 'the page\'s code' : kind}`,
         evidence: [mask(token), where, ...facts],
         means: (none ? 'Its algorithm is "none": it has no signature, so if the server accepts it, anyone can forge one. ' : '') +
@@ -878,6 +890,8 @@ function secretSources({ cookies, scriptTexts, files }) {
   if (window.EngineXray) { window.EngineXray.toggle(); return; }
 
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  // Evidence comes from page code and can be huge (minified bundles), so one line never shows more than 160 characters.
+  const clip = e => { e = String(e); return e.length > 160 ? e.slice(0, 160) + '…' : e; };
   const mb = n => n == null ? '?' : n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? (n / 1024).toFixed(1) + ' KB' : n + ' B';
   const pagesMb = p => p == null ? 'no limit' : mb(p * 65536);
   const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
@@ -1164,7 +1178,7 @@ function secretSources({ cookies, scriptTexts, files }) {
     if (state.security) {
       lines.push('## Security findings', '', '_Secret values are masked._', '');
       for (const [section, list] of Object.entries(state.security)) {
-        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.join('; ')}`) : ['- nothing found']), '');
+        lines.push(`### ${section}`, '', ...(list.length ? sortFindings(list).map(f => `- **${f.sev.toUpperCase()}** ${f.title}: ${f.evidence.slice(0, 12).map(clip).join('; ')}`) : ['- nothing found']), '');
       }
     }
     lines.push('## Where to start', '', ...tips().map(t => '- ' + t.replace(/<[^>]+>/g, '')), '', '_Made with EngineX-ray_');
@@ -1214,7 +1228,7 @@ function secretSources({ cookies, scriptTexts, files }) {
       if (!list.length) { h += `<div class="dim">Nothing found.</div>`; continue; }
       for (const f of sortFindings(list)) {
         h += `<div class="card finding ${f.sev}"><div><span class="sev ${f.sev}">${f.sev}</span><b>${esc(f.title)}</b></div>
-          <div class="list dim">${f.evidence.map(esc).join('\n')}</div>
+          <div class="list dim">${f.evidence.slice(0, 12).map(e => esc(clip(e))).join('\n')}</div>
           <div><b>What it means:</b> ${esc(f.means)}</div><div class="dim"><b>What to do:</b> ${esc(f.todo)}</div></div>`;
       }
     }

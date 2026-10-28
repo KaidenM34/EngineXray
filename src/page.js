@@ -14,10 +14,13 @@ export function wasmUrls() {
 // and tracker names, so it must never scan itself.
 export const SELF_URL = (document.currentScript?.src ?? '').split('?')[0];
 
+// Resolved against the page and never throws: some sites hand back relative or odd script URLs.
+const absUrl = u => { try { return new URL(u, location.href); } catch { return null; } };
+
 export async function scriptHints() {
   const scripts = performance.getEntriesByType('resource')
-    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin === location.origin).map(e => e.name);
-  for (const s of document.scripts) if (s.src && new URL(s.src).origin === location.origin) scripts.push(s.src);
+    .filter(e => e.initiatorType === 'script' && absUrl(e.name)?.origin === location.origin).map(e => e.name);
+  for (const s of document.scripts) { const u = s.src && absUrl(s.src); if (u?.origin === location.origin) scripts.push(u.href); }
   const wasm = new Map(), workers = new Set(), texts = [];
   const queue = [...new Set(scripts)].filter(u => !(SELF_URL && u.split('?')[0] === SELF_URL)).slice(0, 25), done = new Set();
   while (queue.length && done.size < 40) {
@@ -43,14 +46,14 @@ export async function scriptHints() {
 // the same files the page already downloaded, usually straight from cache; scripts that don't allow it are skipped.
 export async function thirdPartyScriptTexts({ max = 30, maxBytes = 3e6 } = {}) {
   const urls = [...new Set(performance.getEntriesByType('resource')
-    .filter(e => e.initiatorType === 'script' && new URL(e.name).origin !== location.origin).map(e => e.name))].slice(0, max);
+    .filter(e => e.initiatorType === 'script' && (absUrl(e.name)?.origin ?? location.origin) !== location.origin).map(e => e.name))].slice(0, max);
   const out = [];
   await Promise.all(urls.map(async url => {
     try {
       const res = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache' });
       if (!res.ok) return;
       const text = await res.text();
-      if (text.length <= maxBytes) out.push([new URL(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
+      if (text.length <= maxBytes) out.push([absUrl(url).hostname + '/' + url.split('/').pop().split('?')[0], text]);
     } catch {}
   }));
   return out;
